@@ -1,0 +1,15 @@
+# JetBrains
+.idea
+
+# sensitive files
+
+.env
+
+
+# Vibe coding
+
+.claude
+
+# python environment
+
+.venv

@@ -9,17 +9,29 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # Agent
     "langchain-core",
     "langgraph",
     "langchain-deepseek",
+    # Data Processing
     "polars",
+    "polars_ds",
+    "numpy",
     "python-dotenv",
-    "textual"
+    "textual",
+
+    "scikit-learn"
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest",
+]
+knowledge = [
+    "chromadb>=0.4.0",
+]
+ensemble_trees = [
+
 ]
 
 [tool.hatch.build.targets.wheel]

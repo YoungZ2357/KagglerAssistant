@@ -2,13 +2,11 @@
 .idea
 
 # sensitive files
-
 .env
 
-
 # Vibe coding
-
 .claude
+proj_context
 
 # python environment
 

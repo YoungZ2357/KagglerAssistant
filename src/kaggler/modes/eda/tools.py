@@ -10,7 +10,8 @@ from kaggler.workspace.data_provider import DataProvider
 from kaggler.modes.eda.compute import (
     get_correlation,
     get_schema_report,
-    get_descriptive_statistics
+    get_descriptive_statistics,
+    get_boxed_data,
 )
 
 # 序列化
@@ -40,6 +41,7 @@ def make_eda_tools(data: DataProvider) -> list[BaseTool]:
         result = json.dumps(get_schema_report(df), ensure_ascii=False)
         return result
 
+    @tool
     def correlation_analysis(state: Annotated[dict, InjectedState], columns: list[str]) -> str:
         """
         分析指定列之间的相关性。自动根据列类型选择统计方法：
@@ -59,6 +61,7 @@ def make_eda_tools(data: DataProvider) -> list[BaseTool]:
         result = json.dumps(get_correlation(df, columns), ensure_ascii=False)
         return result
 
+    @tool
     def descriptive_analysis(state: Annotated[dict, InjectedState], columns: list[str]) -> str:
         """
         对指定列生成描述性统计。columns 必须是精确列名，且为数值类型。
@@ -72,4 +75,18 @@ def make_eda_tools(data: DataProvider) -> list[BaseTool]:
         result = json.dumps(get_descriptive_statistics(df, columns), ensure_ascii=False)
         return result
 
-    return [explore_schema, correlation_analysis, descriptive_analysis]
+
+    @tool
+    def distribution_analysis_raw(state: Annotated[dict, InjectedState], column: str) -> str:
+        """
+        分析指定列的分布情况。数值列返回分箱统计，分类列返回频率表。
+
+        - 用户询问某列的分布、频率、最常出现的值或者取值范围
+
+        不要使用此工具进行描述性统计（均值、标准差等）或相关性分析。
+        """
+        df = data.get(state["data_version"])
+        result = json.dumps(get_boxed_data(df, column), ensure_ascii=False)
+        return result
+    
+    return [explore_schema, correlation_analysis, descriptive_analysis, distribution_analysis_raw]

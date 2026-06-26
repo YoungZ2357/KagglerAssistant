@@ -323,5 +323,83 @@ def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
 
     return output
 
+def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
+    """
+    获取分箱后的数据，可以用于分析数据分布。该数据既可以直接让LLM进行观察，也可以作为"分箱后数据"要求LLM用于调用分布拟合函数
+    Args:
+        df:
+        column: 待分箱列
+        bins: 分箱数量
 
-__all__ = ["get_schema_report", "get_correlation", "get_descriptive_statistics"]
+    Returns:
+
+    """
+    schema = df.schema
+    dtype = schema[column]
+
+    if dtype.is_numeric():
+        col_data = df.select(column).to_series()
+        total = len(col_data)
+        null_count = col_data.null_count()
+
+        min_val = col_data.min()
+        max_val = col_data.max()
+        edges = [min_val + i * (max_val - min_val) / bins for i in range(bins + 1)]
+
+        cut_result = (
+            col_data
+            .cut(edges[1:-1])
+            .value_counts()
+            .sort(column)
+        )
+
+        bin_list = []
+        for row in cut_result.iter_rows(named=True):
+            bin_list.append({
+                "bin": str(row[column]),
+                "count": int(row["count"])
+            })
+        return {
+            "column": column,
+            "dtype": "numeric",
+            "total": total,
+            "null_count": null_count,
+            "min_val": min_val,
+            "max_val": max_val,
+            "bins": bin_list,
+        }
+    else:
+        col_series = df.select(column).to_series()
+        total = len(col_series)
+        null_count = col_series.null_count()
+        full_unique = col_series.n_unique()
+
+        top_n = 20
+        freq_df = (
+            col_series
+            .value_counts()
+            .sort(by="count", descending=True)
+            .head(top_n)
+        )
+        freq_list = []
+        for row in freq_df.iter_rows(named=True):
+            cnt = int(row["count"])
+            freq_list.append({
+                "value": _safe_val(row[column]),
+                "count": cnt,
+                "proportion": round(cnt / total, 4) if total else 0,
+            })
+        return {
+            "column": column,
+            "dtype": "categorical",
+            "total": total,
+            "null_count": null_count,
+            "n_unique": full_unique,
+            "truncated": full_unique > top_n,
+            "frequencies": freq_list,
+        }
+
+
+
+
+__all__ = ["get_schema_report", "get_correlation", "get_descriptive_statistics", "get_boxed_data"]

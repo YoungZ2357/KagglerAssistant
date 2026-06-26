@@ -1,8 +1,8 @@
+import os
+from enum import Enum
 
 from dotenv import load_dotenv
-from enum import Enum
 from langchain_deepseek import ChatDeepSeek
-import os
 
 
 class DeepSeekModel(str, Enum):

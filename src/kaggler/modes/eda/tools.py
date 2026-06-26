@@ -1,21 +1,16 @@
-# LangGraph/LangChain组件
-from langgraph.prebuilt import InjectedState
-from langchain_core.tools import BaseTool, tool
-
-# 额外注释类型
+import json
 from typing import Annotated
 
-# 内部包引用
-from kaggler.workspace.data_provider import DataProvider
-from kaggler.modes.eda.compute import (
-    get_correlation,
-    get_schema_report,
-    get_descriptive_statistics,
-    get_boxed_data,
-)
+from langchain_core.tools import BaseTool, tool
+from langgraph.prebuilt import InjectedState
 
-# 序列化
-import json
+from kaggler.modes.eda.compute import (
+    get_boxed_data,
+    get_correlation,
+    get_descriptive_statistics,
+    get_schema_report,
+)
+from kaggler.workspace.data_provider import DataProvider
 
 def make_tools(data: DataProvider) -> list[BaseTool]:
     """

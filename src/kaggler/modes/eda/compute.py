@@ -1,8 +1,8 @@
-import polars as pl
-from math import isnan, isinf
-# import json
 import itertools
 import math
+from math import isnan, isinf
+
+import polars as pl
 
 
 # 帮手函数

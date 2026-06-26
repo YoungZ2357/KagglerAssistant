@@ -4,9 +4,9 @@
 # FileName: state.py
 # Date: 2026/6/25 12:19
 # -------------------------------------------------------------------------
-from langgraph.graph import MessagesState
-
 from typing import Annotated
+
+from langgraph.graph import MessagesState
 
 from kaggler.shared.types import Mode
 

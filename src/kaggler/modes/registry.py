@@ -4,13 +4,13 @@
 # FileName: registry.py
 # Date: 2026/6/26 10:27
 # -------------------------------------------------------------------------
-from kaggler.shared.types import Mode
-from langchain_core.tools import BaseTool
-
 from dataclasses import dataclass
 from typing import Callable
 
+from langchain_core.tools import BaseTool
+
 from kaggler.modes import eda
+from kaggler.shared.types import Mode
 from kaggler.workspace.data_provider import DataProvider
 
 

@@ -9,5 +9,11 @@
 proj_context
 
 # python environment
-
 .venv
+
+# python cache & build
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/

@@ -17,7 +17,7 @@ from kaggler.modes.eda.compute import (
 # 序列化
 import json
 
-def make_eda_tools(data: DataProvider) -> list[BaseTool]:
+def make_tools(data: DataProvider) -> list[BaseTool]:
     """
 
     Args:
@@ -88,5 +88,5 @@ def make_eda_tools(data: DataProvider) -> list[BaseTool]:
         df = data.get(state["data_version"])
         result = json.dumps(get_boxed_data(df, column), ensure_ascii=False)
         return result
-    
+
     return [explore_schema, correlation_analysis, descriptive_analysis, distribution_analysis_raw]

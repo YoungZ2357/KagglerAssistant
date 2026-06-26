@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-# -------------------------------------------------------------------------
-# ProjectName: KagglerAssistant
-# FileName: data_provider.py
-# Date: 2026/6/26 11:06
-# -------------------------------------------------------------------------
 import polars as pl
 
 class DataProvider:

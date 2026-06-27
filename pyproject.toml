@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest",
+    "pytest-mock",
 ]
 knowledge = [
     "chromadb>=0.4.0",

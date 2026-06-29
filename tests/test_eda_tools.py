@@ -18,13 +18,14 @@ def _by_name(tools):
 
 
 class TestMakeEdaTools:
-    def test_returns_four_named_tools(self, data):
+    def test_returns_five_named_tools(self, data):
         tools = make_tools(data)
         assert set(_by_name(tools)) == {
             "explore_schema",
             "correlation_analysis",
             "descriptive_analysis",
             "distribution_analysis_raw",
+            "distribution_fit",
         }
 
     def test_explore_schema_returns_json_report(self, data):

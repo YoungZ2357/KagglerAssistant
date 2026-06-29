@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from math import isnan, isinf
 
 import polars as pl
+from scipy import stats
 
 
 # 帮手函数 #################################################################
@@ -208,6 +209,31 @@ def _box_data_raw(df: pl.DataFrame, column: str, bins: int = 10) -> BinnedColumn
         column, total, null_count, min_val, max_val,
         edges, [int(c) for c in counts],
     )
+
+
+def _render_numeric_observation(raw: BinnedColumn) -> dict:
+    """
+    [HUMAN] 将机器侧的 BinnedColumn 渲染为面向 LLM 的观察字典：
+    箱标注字符串化、数值取整。get_boxed_data 与 distribution_evaluation 共用，
+    避免"观察"出现两套不一致的表示。
+    """
+    bin_list = []
+    for i, count in enumerate(raw.counts):
+        lo, hi = raw.edges[i], raw.edges[i + 1]
+        # 首箱左闭右闭，其余左开右闭，与 _box_data_raw 的切分语义一致。
+        left = "[" if i == 0 else "("
+        label = f"{left}{_safe_val(lo)}, {_safe_val(hi)}]"
+        bin_list.append({"bin": label, "count": count})
+
+    return {
+        "column": raw.column,
+        "dtype": "numeric",
+        "total": raw.total,
+        "null_count": raw.null_count,
+        "min_val": _safe_val(raw.min_val),
+        "max_val": _safe_val(raw.max_val),
+        "bins": bin_list,
+    }
 
 # 工具函数后端 ###############################################################
 
@@ -418,26 +444,8 @@ def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
     dtype = schema[column]
 
     if dtype.is_numeric():
-        # 复用机器侧分箱逻辑，本分支只负责转成 LLM 易读的标注与取整。
-        raw = _box_data_raw(df, column, bins)
-
-        bin_list = []
-        for i, count in enumerate(raw.counts):
-            lo, hi = raw.edges[i], raw.edges[i + 1]
-            # 首箱左闭右闭，其余左开右闭，与 _box_data_raw 的切分语义一致。
-            left = "[" if i == 0 else "("
-            label = f"{left}{_safe_val(lo)}, {_safe_val(hi)}]"
-            bin_list.append({"bin": label, "count": count})
-
-        return {
-            "column": column,
-            "dtype": "numeric",
-            "total": raw.total,
-            "null_count": raw.null_count,
-            "min_val": _safe_val(raw.min_val),
-            "max_val": _safe_val(raw.max_val),
-            "bins": bin_list,
-        }
+        # 复用机器侧分箱逻辑，再交由共享渲染器转成 LLM 易读的观察字典。
+        return _render_numeric_observation(_box_data_raw(df, column, bins))
     else:
         col_series = df.select(column).to_series()
         total = len(col_series)
@@ -469,7 +477,115 @@ def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
             "frequencies": freq_list,
         }
 
+# 拟合优度配置（后端常量）#####################################################
+_KS_MC_SAMPLES = 999      # 蒙特卡洛重抽样次数，平衡 p 值精度与耗时
+_KS_RANDOM_SEED = 0       # 固定种子，保证工具多次调用结果可复现
+_MIN_FIT_SAMPLES = 8      # 有效样本量低于此值则跳过拟合优度检验
+
+# 候选分布为后端常量：LLM 只需指定列，不参与分布族的选择。
+# 第三项 requires_positive 标记仅在数据严格为正时才有统计意义的分布（含位移参数也强制跳过，
+# 避免在含 0/负值的数据上给出误导性拟合）。
+_CANDIDATE_DISTRIBUTIONS = [
+    ("normal", stats.norm, False),
+    ("uniform", stats.uniform, False),
+    ("exponential", stats.expon, False),
+    ("lognormal", stats.lognorm, True),
+    ("gamma", stats.gamma, True),
+]
 
 
+def distribution_evaluation(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
+    """
+    [HUMAN] 数值列分布评估工具后端：同时给出 (a) 分箱观测数据供 LLM 直接观察，
+    (b) 针对后端候选分布的 KS 拟合优度检验结果。LLM 只需指定列。
 
-__all__ = ["get_schema_report", "get_correlation", "get_descriptive_statistics", "get_boxed_data"]
+    拟合优度采用 scipy.stats.goodness_of_fit（statistic='ks'）：以 MLE 估计各候选分布参数，
+    再用蒙特卡洛模拟得到 p 值，从而校正"参数由数据估计"导致标准 KS 检验过于保守的问题。
+
+    Args:
+        df: Polars DataFrame 格式数据
+        column: 待评估的数值列
+        bins: 观测分箱数量（仅影响 observation 的直方图粒度，不影响 KS 检验）
+
+    Returns:
+        {column, observation, fit} 的字典；列不存在 / 非数值时返回 {"error": ...}。
+    """
+    schema = df.schema
+    if column not in schema.names():
+        return {
+            "error": f"列 '{column}' 不存在。",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+    if not schema[column].is_numeric():
+        return {
+            "error": f"列 '{column}' 为非数值类型，无法进行分布拟合。仅数值列支持 KS 拟合优度检验。",
+            "hint": "分类列的取值分布请使用 distribution_analysis_raw 查看频率表。",
+        }
+
+    raw = _box_data_raw(df, column, bins)
+    observation = _render_numeric_observation(raw)
+
+    values = df.get_column(column).drop_nulls().to_numpy()
+    n = int(values.size)
+
+    fit: dict = {
+        "method": "Kolmogorov–Smirnov 拟合优度（MLE 估参 + 蒙特卡洛 p 值）",
+        "sample_size": n,
+        "caveat": (
+            "p 值由蒙特卡洛模拟估计，已校正参数由数据估计带来的偏差；"
+            "p 值越大越无法拒绝“数据来自该分布”的原假设——只能说明不矛盾，不能据此证明分布成立。"
+        ),
+    }
+
+    if n < _MIN_FIT_SAMPLES:
+        fit["error"] = f"有效样本量 {n} 不足（需 >= {_MIN_FIT_SAMPLES}），跳过拟合优度检验。"
+        return {"column": column, "observation": observation, "fit": fit}
+
+    min_val = float(values.min())
+    candidates: list[dict] = []
+    skipped: list[dict] = []
+    for name, dist, requires_positive in _CANDIDATE_DISTRIBUTIONS:
+        if requires_positive and min_val <= 0:
+            skipped.append({
+                "distribution": name,
+                "reason": "该分布要求严格正值，但数据最小值 <= 0。",
+            })
+            continue
+        try:
+            res = stats.goodness_of_fit(
+                dist, values, statistic="ks",
+                n_mc_samples=_KS_MC_SAMPLES,
+                random_state=_KS_RANDOM_SEED,
+            )
+            candidates.append({
+                "distribution": name,
+                "ks_statistic": _safe_val(float(res.statistic)),
+                "p_value": _safe_val(float(res.pvalue)),
+                "params": {
+                    k: _safe_val(float(v))
+                    for k, v in res.fit_result.params._asdict().items()
+                },
+            })
+        except Exception as e:
+            skipped.append({
+                "distribution": name,
+                "reason": f"拟合失败：{type(e).__name__}",
+            })
+
+    # p 值降序（越大越可能服从）；p 值并列时按 KS 统计量升序（拟合越好）。
+    candidates.sort(key=lambda c: (-(c["p_value"] or 0), c["ks_statistic"] or 1))
+    fit["candidates"] = candidates
+    fit["best_fit"] = candidates[0]["distribution"] if candidates else None
+    if skipped:
+        fit["skipped"] = skipped
+
+    return {"column": column, "observation": observation, "fit": fit}
+
+
+__all__ = [
+    "get_schema_report",
+    "get_correlation",
+    "get_descriptive_statistics",
+    "get_boxed_data",
+    "distribution_evaluation",
+]

@@ -10,10 +10,10 @@
 会话记忆由编译图的 checkpointer 按 ``thread_id`` 持久化，故仅首轮注入种子 state
 （current_mode / file_path / data_version），后续仅传新问题——与 cli.py 同源。
 """
-from typing import Iterator
+from typing import Any, Iterator
 from uuid import uuid4
 
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
@@ -32,28 +32,67 @@ class AgentSession:
         self._config = {"configurable": {"thread_id": uuid4().hex}}
         self._seeded = False
 
-    def stream(self, question: str) -> Iterator[str]:
-        """逐 token 产出本轮回答的文本片段。
-
-        只透出 react 节点的文本 token：仅带 ``tool_calls``、content 为空的中间轮
-        会被 ``chunk.content`` 过滤掉，因此工具调用不外泄给 UI。
-        """
+    def _seed_payload(self, question: str) -> dict:
+        """构造本轮入图 payload；种子 state 仅首轮注入，其余由 checkpointer 续写。"""
         payload: dict = {"messages": [HumanMessage(content=question)]}
         if not self._seeded:
-            # 种子 state 仅首轮注入；其余 channel 由 checkpointer 按 thread_id 续写
             payload |= {
                 "current_mode": Mode.EDA,
                 "file_path": self._csv_path,
                 "data_version": 0,
             }
             self._seeded = True
+        return payload
 
-        for chunk, metadata in self._graph.stream(
-            payload, config=self._config, stream_mode="messages"
+    def stream_events(self, question: str) -> Iterator[dict[str, Any]]:
+        """逐事件产出本轮过程，供 UI 同时驱动「回答」与「Agent 行为追溯」。
+
+        事件类型：
+        - ``{"type": "node_active", "node": str}``  —— 进入某节点（react/tools/…）
+        - ``{"type": "token", "content": str}``     —— react 节点的回答文本片段
+        - ``{"type": "node_done", "node": str, "tool_calls": list[dict]}``
+                                                    —— 节点产出一批 state 更新
+
+        仅透出节点流转与 tool_calls（Agent 决策了什么 / 调了什么工具）；**不**透出
+        tool_result 等数据呈现内容——那是另一类需求，不在追溯范围内。
+        """
+        current_node: str | None = None
+        for mode, data in self._graph.stream(
+            self._seed_payload(question),
+            config=self._config,
+            stream_mode=["updates", "messages"],
         ):
-            if (
-                metadata.get("langgraph_node") == Node.REACT
-                and isinstance(chunk, AIMessageChunk)
-                and chunk.content
-            ):
-                yield chunk.content
+            if mode == "messages":
+                chunk, metadata = data
+                node = metadata.get("langgraph_node")
+                if node and node != current_node:
+                    current_node = node
+                    yield {"type": "node_active", "node": node}
+                if (
+                    node == Node.REACT
+                    and isinstance(chunk, AIMessageChunk)
+                    and chunk.content
+                ):
+                    yield {"type": "token", "content": chunk.content}
+            elif mode == "updates":
+                # updates 批次边界：清空当前节点，使下一次 messages 事件能重新报 active
+                current_node = None
+                for node_name, state_update in data.items():
+                    tool_calls: list[dict] = []
+                    for msg in (state_update or {}).get("messages", []):
+                        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                            tool_calls = [
+                                {"name": tc["name"], "args": tc["args"]}
+                                for tc in msg.tool_calls
+                            ]
+                    yield {
+                        "type": "node_done",
+                        "node": node_name,
+                        "tool_calls": tool_calls,
+                    }
+
+    def stream(self, question: str) -> Iterator[str]:
+        """便捷封装：仅逐 token 产出回答文本（不关心追溯的调用方用它）。"""
+        for ev in self.stream_events(question):
+            if ev["type"] == "token":
+                yield ev["content"]

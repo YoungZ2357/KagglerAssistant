@@ -1,5 +1,7 @@
 from functools import partial
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -31,6 +33,10 @@ def build_graph(
     路由全部使用 ``Node`` 枚举 + list 形式 path_map（省掉自映射 dict）。
     """
     cfg = graph_config or GraphConfig()
+
+    # 从仓库根目录的 .env 注入密钥（DEEPSEEK_API_KEY 等），使安装后用 `kaggler`
+    # 命令从任意工作目录启动也能读到。不覆盖已存在的环境变量（dotenv 默认行为）。
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
     # 运行时实例化：每个 mode 的工具与提示词；common 工具全 mode 可见
     tools_by_mode: dict[Mode, list[BaseTool]] = {

@@ -1,0 +1,51 @@
+/* ── 单栏对话布局 ── */
+
+Header {
+    dock: top;
+}
+
+RichLog#chat-log {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#streaming-msg {
+    height: auto;
+    max-height: 10;
+    padding: 0 1;
+    border-top: dashed $panel;
+    color: $text;
+}
+
+Input#user-input {
+    dock: bottom;
+    height: auto;
+}
+
+/* ── 数据集选择弹窗 ── */
+
+FilePickerScreen {
+    align: center middle;
+}
+
+#file-picker-dialog {
+    width: 60;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#fp-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#fp-buttons {
+    margin-top: 1;
+    height: auto;
+}
+
+#fp-confirm {
+    margin-right: 1;
+}

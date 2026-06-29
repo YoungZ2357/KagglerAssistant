@@ -39,6 +39,13 @@ ensemble_trees = [
 
 ]
 
+[project.scripts]
+# 安装后即可用命令启动，无需再 `python -m` 跑源码：
+#   kaggler      → 启动 TUI 对话界面
+#   kaggler-cli  → 启动最小 REPL（需传数据集路径）
+kaggler = "kaggler.app.tui.app:main"
+kaggler-cli = "kaggler.app.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/kaggler"]
 

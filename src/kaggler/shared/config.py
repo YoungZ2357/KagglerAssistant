@@ -1,7 +1,6 @@
 import os
 from enum import Enum
 
-from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
 from pydantic_settings import BaseSettings
 

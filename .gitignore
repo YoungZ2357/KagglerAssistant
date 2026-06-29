@@ -18,3 +18,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Test
+.coverage
+.coverage

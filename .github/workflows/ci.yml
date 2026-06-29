@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ruff
+        run: pip install ruff==0.15.4
+
+      # 任何 lint 命中（警告/错误）→ ruff 退出码非 0 → CI 失败
+      - name: Ruff check
+        run: ruff check src tests
+
+  test:
+    name: Tests + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package with test extras
+        run: pip install -e ".[test]"
+
+      # 覆盖率低于 85% → --cov-fail-under 触发非 0 退出 → CI 失败
+      - name: Run tests with coverage
+        run: pytest --cov=kaggler --cov-report=term-missing --cov-fail-under=85

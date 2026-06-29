@@ -2,14 +2,23 @@
 .idea
 
 # sensitive files
-
 .env
 
-
 # Vibe coding
-
 .claude
+proj_context
+nul
 
 # python environment
-
 .venv
+
+# python cache & build
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Test
+.coverage
+

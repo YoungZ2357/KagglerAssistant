@@ -1,0 +1,120 @@
+/* ── 单栏对话布局 ── */
+
+Header {
+    dock: top;
+}
+
+/* 主区：左栏对话 + 右栏 Agent 行为追溯 */
+#main {
+    height: 1fr;
+}
+
+/* 左栏单一对话窗：历史与进行中的回答同住一个可滚动容器 */
+VerticalScroll#chat-log {
+    width: 7fr;
+    height: 1fr;
+    padding: 0 1;
+    border-right: tall $panel;
+}
+
+#chat-log > Static {
+    height: auto;
+    margin-bottom: 1;
+}
+
+/* 右栏：Agent 行为追溯 */
+#trace-col {
+    width: 3fr;
+}
+
+.panel-title {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+    text-style: bold;
+}
+
+RichLog#agent-trace {
+    height: 1fr;
+    padding: 0 1;
+}
+
+Input#user-input {
+    dock: bottom;
+    height: auto;
+}
+
+/* ── 数据集选择弹窗 ── */
+
+FilePickerScreen {
+    align: center middle;
+}
+
+#file-picker-dialog {
+    width: 60;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#fp-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#fp-buttons {
+    margin-top: 1;
+    height: auto;
+}
+
+#fp-browse {
+    margin-right: 1;
+}
+
+#fp-confirm {
+    margin-right: 1;
+}
+
+/* ── 文件浏览器弹窗 ── */
+
+DirectoryBrowserScreen {
+    align: center middle;
+}
+
+#dir-browser-dialog {
+    width: 80;
+    height: 30;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#db-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#db-rootbar {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#db-root {
+    width: 1fr;
+}
+
+#db-go {
+    margin-left: 1;
+}
+
+DirectoryTree#db-tree {
+    height: 1fr;
+    border: round $panel;
+}
+
+#db-buttons {
+    height: auto;
+    margin-top: 1;
+}

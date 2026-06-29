@@ -1,0 +1,25 @@
+# Inherit all default Gitleaks rules (generic secrets, cloud keys, etc.)
+[extend]
+useDefault = true
+
+# OpenAI classic key: sk-<20chars>T3BlbkFJ<20chars>
+# (Gitleaks defaults include a variant; this one is stricter on structure)
+[[rules]]
+id          = "openai-api-key-classic"
+description = "OpenAI API Key (classic format with T3BlbkFJ marker)"
+regex       = '''(?i)sk-[a-z0-9]{20}T3BlbkFJ[a-z0-9]{20}'''
+tags        = ["key", "openai", "critical"]
+
+# OpenAI project-scoped key: sk-proj-...
+[[rules]]
+id          = "openai-api-key-project"
+description = "OpenAI Project API Key (sk-proj-... format)"
+regex       = '''sk-proj-[A-Za-z0-9_\-]{50,200}'''
+tags        = ["key", "openai", "critical"]
+
+# OpenAI service-account key: sk-svcacct-...
+[[rules]]
+id          = "openai-api-key-svcacct"
+description = "OpenAI Service Account API Key (sk-svcacct-... format)"
+regex       = '''sk-svcacct-[A-Za-z0-9_\-]{50,200}'''
+tags        = ["key", "openai", "critical"]

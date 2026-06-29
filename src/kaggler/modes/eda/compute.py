@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass
 from math import isnan, isinf
 
+import numpy as np
 import polars as pl
 from scipy import stats
 
@@ -478,9 +479,33 @@ def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
         }
 
 # 拟合优度配置（后端常量）#####################################################
-_KS_MC_SAMPLES = 999      # 蒙特卡洛重抽样次数，平衡 p 值精度与耗时
-_KS_RANDOM_SEED = 0       # 固定种子，保证工具多次调用结果可复现
+# 两套方法：
+# - chi2（默认）：基于分箱的 Pearson 卡方拟合优度。每个分布仅做 1 次 MLE + 解析 p 值，
+#   耗时 ~毫秒，与样本量几乎无关，是「数据是否服从某分布」的快速判定首选。
+# - monte_carlo（保留）：scipy.stats.goodness_of_fit（KS + 参数化自举），更严格但每个
+#   分布要重复 MLE 数百次，gamma 等数值优化分布在大列上可达数十秒，故下采样 + 降重抽样。
+_FIT_METHODS = ("chi2", "monte_carlo")
+_DEFAULT_FIT_METHOD = "chi2"
+# 容错别名 → 规范方法名：模型/调用方可能给出大小写或近义写法（如 "mc"、"Monte Carlo"），
+# 归一后再匹配，避免"用户要求蒙特卡洛却被静默回退到 chi2"。
+_FIT_METHOD_ALIASES = {
+    "chi2": "chi2", "chisquare": "chi2", "chi_square": "chi2",
+    "chi-square": "chi2", "chisq": "chi2",
+    "monte_carlo": "monte_carlo", "montecarlo": "monte_carlo",
+    "monte-carlo": "monte_carlo", "mc": "monte_carlo", "ks": "monte_carlo",
+}
+
+
+def _normalize_fit_method(method: str) -> str:
+    """把调用方给的 method 归一到规范方法名；无法识别时回退默认（chi2）。"""
+    key = str(method).strip().lower().replace(" ", "_")
+    return _FIT_METHOD_ALIASES.get(key, _DEFAULT_FIT_METHOD)
+
+_KS_MC_SAMPLES = 199      # 蒙特卡洛重抽样次数（原 999；gamma MLE 是瓶颈，降到 199 约 5x 提速）
+_MC_MAX_SAMPLES = 5000    # 蒙特卡洛拟合前对超大列下采样的上限，避免单列耗时随行数爆炸
+_KS_RANDOM_SEED = 0       # 固定种子，保证工具多次调用结果可复现（含下采样）
 _MIN_FIT_SAMPLES = 8      # 有效样本量低于此值则跳过拟合优度检验
+_CHI2_MIN_EXPECTED = 5.0  # 卡方检验每箱期望频数下限，低于此与相邻箱合并以满足卡方近似前提
 
 # 候选分布为后端常量：LLM 只需指定列，不参与分布族的选择。
 # 第三项 requires_positive 标记仅在数据严格为正时才有统计意义的分布（含位移参数也强制跳过，
@@ -494,18 +519,126 @@ _CANDIDATE_DISTRIBUTIONS = [
 ]
 
 
-def distribution_evaluation(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
+def _param_names(dist) -> list[str]:
+    """分布的有序参数名：形状参数（若有）+ loc + scale，与 dist.fit 返回元组一一对应。"""
+    shapes = [s.strip() for s in dist.shapes.split(",")] if dist.shapes else []
+    return [*shapes, "loc", "scale"]
+
+
+def _merge_low_expected(
+    observed: np.ndarray, expected: np.ndarray, min_expected: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """从左到右累积合并期望频数过低的相邻箱，使每个合并箱的期望 >= min_expected。
+
+    卡方近似要求各箱期望频数不过小（经验阈值 5）；尾部残余不足一组时并入最后一组。
+    """
+    merged_o: list[float] = []
+    merged_e: list[float] = []
+    acc_o = acc_e = 0.0
+    for o, e in zip(observed, expected):
+        acc_o += float(o)
+        acc_e += float(e)
+        if acc_e >= min_expected:
+            merged_o.append(acc_o)
+            merged_e.append(acc_e)
+            acc_o = acc_e = 0.0
+    if acc_e > 0:
+        if merged_e:
+            merged_o[-1] += acc_o
+            merged_e[-1] += acc_e
+        else:
+            merged_o.append(acc_o)
+            merged_e.append(acc_e)
+    return np.asarray(merged_o), np.asarray(merged_e)
+
+
+def _chi_square_fit(name: str, dist, values: np.ndarray, raw: BinnedColumn) -> dict:
+    """单分布卡方拟合优度检验（解析法）：1 次 MLE 估参 + 按分箱期望频数算卡方统计量。
+
+    期望频数由拟合分布的 CDF 在分箱边界上的差分给出；首/末箱分别向 ∓∞ 延伸，
+    使期望概率和为 1（覆盖落在 [min, max] 之外的概率质量）。自由度按"估计参数个数"
+    修正（df = 合并后箱数 - 1 - 估参数），与蒙特卡洛对"参数由数据估计"的校正同源。
+    """
+    params = dist.fit(values)                 # 一次 MLE；蒙特卡洛要重复数百次
+    frozen = dist(*params)
+
+    edges = np.asarray(raw.edges, dtype=float)
+    cdf = frozen.cdf(edges)
+    probs = np.diff(cdf)
+    probs[0] = cdf[1]              # 首箱左端延伸到 -∞：P(X <= edges[1])
+    probs[-1] = 1.0 - cdf[-2]     # 末箱右端延伸到 +∞：P(X > edges[-2])
+
+    observed = np.asarray(raw.counts, dtype=float)
+    expected = observed.sum() * probs
+    obs_m, exp_m = _merge_low_expected(observed, expected, _CHI2_MIN_EXPECTED)
+
+    n_params = len(params)
+    dof = len(obs_m) - 1 - n_params
+    if dof < 1:
+        raise ValueError(
+            f"有效箱数 {len(obs_m)} 不足以在估计 {n_params} 个参数后保留自由度（df={dof}）。"
+        )
+
+    statistic = float(np.sum((obs_m - exp_m) ** 2 / exp_m))
+    p_value = float(stats.chi2.sf(statistic, dof))
+    return {
+        "distribution": name,
+        "statistic": _safe_val(statistic),
+        "dof": dof,
+        "p_value": _safe_val(p_value),
+        "params": {
+            k: _safe_val(float(v)) for k, v in zip(_param_names(dist), params)
+        },
+    }
+
+
+def _monte_carlo_fit(name: str, dist, values: np.ndarray) -> dict:
+    """单分布 KS 拟合优度（scipy.goodness_of_fit，参数化自举 p 值）。
+
+    超过 _MC_MAX_SAMPLES 的列先无放回下采样（固定种子），把"每个 MC 样本重复 MLE"
+    的成本压到可控范围；这只影响 p 值精度，不改变方法本身。
+    """
+    sample = values
+    if sample.size > _MC_MAX_SAMPLES:
+        rng = np.random.default_rng(_KS_RANDOM_SEED)
+        sample = rng.choice(sample, _MC_MAX_SAMPLES, replace=False)
+    res = stats.goodness_of_fit(
+        dist, sample, statistic="ks",
+        n_mc_samples=_KS_MC_SAMPLES,
+        random_state=_KS_RANDOM_SEED,
+    )
+    return {
+        "distribution": name,
+        "statistic": _safe_val(float(res.statistic)),
+        "p_value": _safe_val(float(res.pvalue)),
+        "params": {
+            k: _safe_val(float(v))
+            for k, v in res.fit_result.params._asdict().items()
+        },
+    }
+
+
+def distribution_evaluation(
+    df: pl.DataFrame, column: str, bins: int = 10, method: str = _DEFAULT_FIT_METHOD,
+) -> dict:
     """
     [HUMAN] 数值列分布评估工具后端：同时给出 (a) 分箱观测数据供 LLM 直接观察，
-    (b) 针对后端候选分布的 KS 拟合优度检验结果。LLM 只需指定列。
+    (b) 针对后端候选分布的拟合优度检验结果。LLM 只需指定列。
 
-    拟合优度采用 scipy.stats.goodness_of_fit（statistic='ks'）：以 MLE 估计各候选分布参数，
-    再用蒙特卡洛模拟得到 p 值，从而校正"参数由数据估计"导致标准 KS 检验过于保守的问题。
+    两种检验方法（method）：
+    - "chi2"（默认）：基于分箱的 Pearson 卡方拟合优度。每个分布仅做 1 次 MLE，解析得到
+      p 值，耗时与样本量几乎无关（毫秒级），适合作为"是否服从某分布"的默认快速判定。
+    - "monte_carlo"：scipy.stats.goodness_of_fit（KS + 参数化自举）。统计上更严格，但每个
+      分布要重复数百次 MLE，大列耗时显著（已做下采样 + 降重抽样优化）。
+
+    两种方法的 candidate 结构一致（distribution / statistic / p_value / params），仅 chi2
+    额外带 dof；p 值含义相同：越大越无法拒绝"数据来自该分布"的原假设。
 
     Args:
         df: Polars DataFrame 格式数据
         column: 待评估的数值列
-        bins: 观测分箱数量（仅影响 observation 的直方图粒度，不影响 KS 检验）
+        bins: 观测/卡方分箱数量（影响 observation 粒度；chi2 直接以此分箱算期望频数）
+        method: "chi2"（默认）或 "monte_carlo"；非法取值回退为默认。
 
     Returns:
         {column, observation, fit} 的字典；列不存在 / 非数值时返回 {"error": ...}。
@@ -518,9 +651,11 @@ def distribution_evaluation(df: pl.DataFrame, column: str, bins: int = 10) -> di
         }
     if not schema[column].is_numeric():
         return {
-            "error": f"列 '{column}' 为非数值类型，无法进行分布拟合。仅数值列支持 KS 拟合优度检验。",
+            "error": f"列 '{column}' 为非数值类型，无法进行分布拟合。仅数值列支持拟合优度检验。",
             "hint": "分类列的取值分布请使用 distribution_analysis_raw 查看频率表。",
         }
+
+    method = _normalize_fit_method(method)
 
     raw = _box_data_raw(df, column, bins)
     observation = _render_numeric_observation(raw)
@@ -528,14 +663,27 @@ def distribution_evaluation(df: pl.DataFrame, column: str, bins: int = 10) -> di
     values = df.get_column(column).drop_nulls().to_numpy()
     n = int(values.size)
 
-    fit: dict = {
-        "method": "Kolmogorov–Smirnov 拟合优度（MLE 估参 + 蒙特卡洛 p 值）",
-        "sample_size": n,
-        "caveat": (
-            "p 值由蒙特卡洛模拟估计，已校正参数由数据估计带来的偏差；"
-            "p 值越大越无法拒绝“数据来自该分布”的原假设——只能说明不矛盾，不能据此证明分布成立。"
-        ),
-    }
+    if method == "chi2":
+        fit: dict = {
+            "method": "Pearson 卡方拟合优度（MLE 估参 + 解析 p 值，自由度按估参数修正）",
+            "statistic_name": "chi_square",
+            "sample_size": n,
+            "caveat": (
+                "基于分箱的卡方近似（每箱期望 < 5 时与相邻箱合并）；自由度已扣除估计参数个数。"
+                "p 值越大越无法拒绝“数据来自该分布”的原假设——只能说明不矛盾，不能据此证明分布成立。"
+            ),
+        }
+    else:
+        fit = {
+            "method": "Kolmogorov–Smirnov 拟合优度（MLE 估参 + 蒙特卡洛 p 值）",
+            "statistic_name": "ks",
+            "sample_size": n,
+            "caveat": (
+                f"p 值由蒙特卡洛模拟估计（{_KS_MC_SAMPLES} 次重抽样，样本超 {_MC_MAX_SAMPLES} 时下采样），"
+                "已校正参数由数据估计带来的偏差；"
+                "p 值越大越无法拒绝“数据来自该分布”的原假设——只能说明不矛盾，不能据此证明分布成立。"
+            ),
+        }
 
     if n < _MIN_FIT_SAMPLES:
         fit["error"] = f"有效样本量 {n} 不足（需 >= {_MIN_FIT_SAMPLES}），跳过拟合优度检验。"
@@ -552,28 +700,18 @@ def distribution_evaluation(df: pl.DataFrame, column: str, bins: int = 10) -> di
             })
             continue
         try:
-            res = stats.goodness_of_fit(
-                dist, values, statistic="ks",
-                n_mc_samples=_KS_MC_SAMPLES,
-                random_state=_KS_RANDOM_SEED,
-            )
-            candidates.append({
-                "distribution": name,
-                "ks_statistic": _safe_val(float(res.statistic)),
-                "p_value": _safe_val(float(res.pvalue)),
-                "params": {
-                    k: _safe_val(float(v))
-                    for k, v in res.fit_result.params._asdict().items()
-                },
-            })
+            if method == "chi2":
+                candidates.append(_chi_square_fit(name, dist, values, raw))
+            else:
+                candidates.append(_monte_carlo_fit(name, dist, values))
         except Exception as e:
             skipped.append({
                 "distribution": name,
                 "reason": f"拟合失败：{type(e).__name__}",
             })
 
-    # p 值降序（越大越可能服从）；p 值并列时按 KS 统计量升序（拟合越好）。
-    candidates.sort(key=lambda c: (-(c["p_value"] or 0), c["ks_statistic"] or 1))
+    # p 值降序（越大越可能服从）；p 值并列时按检验统计量升序（拟合越好）。
+    candidates.sort(key=lambda c: (-(c["p_value"] or 0), c["statistic"] or 1))
     fit["candidates"] = candidates
     fit["best_fit"] = candidates[0]["distribution"] if candidates else None
     if skipped:

@@ -373,6 +373,35 @@ class TestDistributionEvaluation:
         assert pvals["normal"] > pvals["uniform"]
         assert pvals["normal"] > pvals["exponential"]
 
+    def test_default_method_is_chi2(self):
+        df = pl.DataFrame({"v": [float(i % 7) for i in range(60)]})
+        result = distribution_evaluation(df, "v")
+        # 默认走卡方：统计量命名为 chi_square，且每个候选带自由度 dof。
+        assert result["fit"]["statistic_name"] == "chi_square"
+        for c in result["fit"]["candidates"]:
+            assert "dof" in c and c["dof"] >= 1
+
+    def test_invalid_method_falls_back_to_chi2(self):
+        df = pl.DataFrame({"v": [float(i % 7) for i in range(60)]})
+        result = distribution_evaluation(df, "v", method="nonsense")
+        assert result["fit"]["statistic_name"] == "chi_square"
+
+    def test_monte_carlo_method_selectable(self):
+        rng = __import__("numpy").random.default_rng(7)
+        df = pl.DataFrame({"v": rng.normal(0, 1, 300).tolist()})
+        result = distribution_evaluation(df, "v", method="monte_carlo")
+        # 保留的蒙特卡洛法：统计量为 KS，正态数据下正态候选不应被拒绝。
+        assert result["fit"]["statistic_name"] == "ks"
+        pvals = {c["distribution"]: c["p_value"] for c in result["fit"]["candidates"]}
+        assert pvals["normal"] > 0.05
+
+    def test_chi2_best_fit_identifies_gamma(self):
+        rng = __import__("numpy").random.default_rng(1)
+        df = pl.DataFrame({"v": rng.gamma(2.0, 3.0, 4000).tolist()})
+        result = distribution_evaluation(df, "v")
+        # 卡方法在 gamma 数据上应把 gamma 选为最佳候选（其余候选 p 值更低）。
+        assert result["fit"]["best_fit"] == "gamma"
+
     def test_includes_observation(self):
         df = pl.DataFrame({"v": [float(i) for i in range(50)]})
         result = distribution_evaluation(df, "v", bins=5)

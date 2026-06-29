@@ -1,5 +1,5 @@
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import InjectedState
@@ -86,19 +86,30 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         return result
 
     @tool
-    def distribution_fit(state: Annotated[dict, InjectedState], column: str) -> str:
+    def distribution_fit(
+        state: Annotated[dict, InjectedState],
+        column: str,
+        method: Literal["chi2", "monte_carlo"] = "chi2",
+    ) -> str:
         """
         检验某个数值列是否服从常见分布（正态、均匀、指数、对数正态、伽马）。
-        返回分箱观测数据 + 各候选分布的 Kolmogorov–Smirnov 拟合优度（统计量、p 值、估计参数）。
+        返回分箱观测数据 + 各候选分布的拟合优度（检验统计量、p 值、估计参数）。
 
         使用情景：
         - 用户询问某列是否服从正态分布 / 某种分布，或需要判断分布形态以选择建模/变换策略
 
-        说明：候选分布固定由后端决定，调用方只需给出列名；p 值越大越无法拒绝该分布假设。
-        不要使用此工具进行描述性统计或相关性分析。
+        参数 method：
+        - "chi2"（默认）：基于分箱的卡方拟合优度，毫秒级，绝大多数情况下用它即可。
+        - "monte_carlo"：KS + 蒙特卡洛 p 值，统计上更严格但慢得多（大列可达数十秒），
+          仅当用户明确要求更严格/更精确的检验时才使用。
+
+        说明：候选分布固定由后端决定，调用方只需给出列名（必要时指定 method）；
+        p 值越大越无法拒绝该分布假设。不要使用此工具进行描述性统计或相关性分析。
         """
         df = data.get(state["data_version"])
-        result = json.dumps(distribution_evaluation(df, column), ensure_ascii=False)
+        result = json.dumps(
+            distribution_evaluation(df, column, method=method), ensure_ascii=False
+        )
         return result
 
     return [

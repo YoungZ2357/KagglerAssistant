@@ -1,11 +1,12 @@
 import itertools
 import math
+from dataclasses import dataclass
 from math import isnan, isinf
 
 import polars as pl
 
 
-# 帮手函数
+# 帮手函数 #################################################################
 def _safe_val(v):
     """
     [HUMAN]将Polars值转化为安全的Python原生类型，以便于序列化
@@ -129,7 +130,86 @@ def _eta_squared(df: pl.DataFrame, cat_col: str, num_col: str) -> float | None:
     return ss_between / ss_total
 
 
-# 工具函数运算部分
+@dataclass(frozen=True)
+class BinnedColumn:
+    """
+    [HUMAN] 数值列等宽分箱后的机器友好结构，供下游计算工具（如分布拟合 / 卡方拟合优度检验）直接消费。
+
+    约定：
+    - counts 为定长向量，长度 == len(edges) - 1，包含计数为 0 的空箱；
+    - edges 为等宽切分边界，长度 == bins + 1，保留完整精度（不做四舍五入）；
+    - sum(counts) == total - null_count（空值不计入任何箱）。
+    """
+    column: str
+    total: int               # 总行数，含空值
+    null_count: int          # 空值数量
+    min_val: float | None     # 非空最小值；全空时为 None
+    max_val: float | None     # 非空最大值；全空时为 None
+    edges: list[float]        # 分箱边界，全空时为 []
+    counts: list[int]         # 各箱观测频数，全空时为 []
+
+
+def _box_data_raw(df: pl.DataFrame, column: str, bins: int = 10) -> BinnedColumn:
+    """
+    [HUMAN] 数值列等宽分箱核心逻辑（机器侧）。仅支持数值列，空值在分箱前被剔除。
+
+    与面向 LLM 的 get_boxed_data 区别：本函数返回定长、对齐的计数/边界，
+    适合作为分布拟合优度检验等下游工具的输入；不做任何展示用的字符串化或取整。
+
+    Args:
+        df: Polars DataFrame 格式数据
+        column: 待分箱的数值列
+        bins: 等宽分箱数量（>= 1）
+
+    Returns:
+        BinnedColumn
+
+    Raises:
+        ValueError: bins < 1，或列为非数值类型。
+    """
+    if bins < 1:
+        raise ValueError(f"bins 必须 >= 1，收到 {bins}。")
+
+    dtype = df.schema[column]
+    if not dtype.is_numeric():
+        raise ValueError(
+            f"列 '{column}' 类型为 {dtype}，_box_data_raw 仅支持数值列。"
+            "分类列的分布请使用 get_boxed_data 的频率表。"
+        )
+
+    series = df.get_column(column)
+    total = series.len()
+    null_count = series.null_count()
+
+    clean = series.drop_nulls()
+    if clean.len() == 0:
+        return BinnedColumn(column, total, null_count, None, None, [], [])
+
+    min_val = float(clean.min())
+    max_val = float(clean.max())
+
+    # 退化情形：常数列无法等宽切分，全部非空值计入单一箱。
+    if max_val == min_val:
+        return BinnedColumn(
+            column, total, null_count, min_val, max_val,
+            [min_val, max_val], [clean.len()],
+        )
+
+    # 显式提供边界，保证返回定长计数（含空箱），且首箱左闭、其余左开右闭，
+    # sum(counts) == clean.len()。相较 value_counts() 不会丢失计数为 0 的箱。
+    edges = [min_val + i * (max_val - min_val) / bins for i in range(bins + 1)]
+    counts = (
+        clean
+        .hist(bins=edges, include_breakpoint=False, include_category=False)
+        .to_series()
+        .to_list()
+    )
+    return BinnedColumn(
+        column, total, null_count, min_val, max_val,
+        edges, [int(c) for c in counts],
+    )
+
+# 工具函数后端 ###############################################################
 
 def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
     """
@@ -219,7 +299,7 @@ def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
 
 def get_schema_report(df: pl.DataFrame) -> dict:
     """
-    获取数据集的结构信息，用于让LLM/Agent对数据集有初步感知，避免与数据集直接接触
+    [HUMAN]获取数据集的结构信息，用于让LLM/Agent对数据集有初步感知，避免与数据集直接接触
     Returns: 数据库schema结果
     Args:
         df: Polars DataFrame 格式数据
@@ -325,7 +405,7 @@ def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
 
 def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
     """
-    获取分箱后的数据，可以用于分析数据分布。该数据既可以直接让LLM进行观察，也可以作为"分箱后数据"要求LLM用于调用分布拟合函数
+    [HUMAN]获取分箱后的数据，可以用于分析数据分布。该数据既可以直接让LLM进行观察，也可以作为"分箱后数据"要求LLM用于调用分布拟合函数
     Args:
         df:
         column: 待分箱列
@@ -338,34 +418,24 @@ def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
     dtype = schema[column]
 
     if dtype.is_numeric():
-        col_data = df.select(column).to_series()
-        total = len(col_data)
-        null_count = col_data.null_count()
-
-        min_val = col_data.min()
-        max_val = col_data.max()
-        edges = [min_val + i * (max_val - min_val) / bins for i in range(bins + 1)]
-
-        cut_result = (
-            col_data
-            .cut(edges[1:-1])
-            .value_counts()
-            .sort(column)
-        )
+        # 复用机器侧分箱逻辑，本分支只负责转成 LLM 易读的标注与取整。
+        raw = _box_data_raw(df, column, bins)
 
         bin_list = []
-        for row in cut_result.iter_rows(named=True):
-            bin_list.append({
-                "bin": str(row[column]),
-                "count": int(row["count"])
-            })
+        for i, count in enumerate(raw.counts):
+            lo, hi = raw.edges[i], raw.edges[i + 1]
+            # 首箱左闭右闭，其余左开右闭，与 _box_data_raw 的切分语义一致。
+            left = "[" if i == 0 else "("
+            label = f"{left}{_safe_val(lo)}, {_safe_val(hi)}]"
+            bin_list.append({"bin": label, "count": count})
+
         return {
             "column": column,
             "dtype": "numeric",
-            "total": total,
-            "null_count": null_count,
-            "min_val": min_val,
-            "max_val": max_val,
+            "total": raw.total,
+            "null_count": raw.null_count,
+            "min_val": _safe_val(raw.min_val),
+            "max_val": _safe_val(raw.max_val),
             "bins": bin_list,
         }
     else:

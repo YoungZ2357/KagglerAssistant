@@ -2,7 +2,7 @@ import polars as pl
 
 class DataProvider:
     def __init__(self) -> None:
-        self._frames = dict[int: pl.DataFrame]
+        self._frames: dict[int, pl.DataFrame] = {}
 
     def load_initial(self, path: str) -> None:
         self._frames[0] = pl.read_csv(path)

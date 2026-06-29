@@ -27,13 +27,8 @@ class ModeSpec:
 data = DataProvider()
 data.load_initial(csv_path)
 
-# 在这里初始化通用工具
-common_tools = make_common_tools()
-
-
-# 在这里注入通用工具
 tools_by_mode = {
-    mode: [spec.tool_factory(data), *common_tools]
+    mode: spec.tool_factory(data)
     for mode, spec in REGISTRY.items()
 }
 
@@ -45,9 +40,7 @@ prompt_templates: dict[Mode, str] = {
 """
 
 REGISTRY: dict[Mode, ModeSpec] = {
-    Mode.EDA: ModeSpec(
-        tool_factory=eda.make_tools, prompt=eda.EDA_SYSTEM_PROMPT_TEMPLATE
-    )
+    Mode.EDA: ModeSpec(tool_factory=eda.make_tools, prompt=eda.EDA_SYSTEM_PROMPT_TEMPLATE)
 }
 
 

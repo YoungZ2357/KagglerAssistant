@@ -3,11 +3,18 @@ from enum import Enum
 
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
-
+from pydantic_settings import BaseSettings
 
 class DeepSeekModel(str, Enum):
     FLASH = "deepseek-v4-flash"
     PRO = "deepseek-v4-pro"
+
+
+class GraphConfig(BaseSettings):
+    summary_trigger_count: int = 20
+    summary_keep_recent: int = 4
+
+
 
 
 def make_llm_raw(

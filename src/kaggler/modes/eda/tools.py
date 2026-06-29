@@ -5,6 +5,7 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import InjectedState
 
 from kaggler.modes.eda.compute import (
+    distribution_evaluation,
     get_boxed_data,
     get_correlation,
     get_descriptive_statistics,
@@ -84,4 +85,26 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         result = json.dumps(get_boxed_data(df, column), ensure_ascii=False)
         return result
 
-    return [explore_schema, correlation_analysis, descriptive_analysis, distribution_analysis_raw]
+    @tool
+    def distribution_fit(state: Annotated[dict, InjectedState], column: str) -> str:
+        """
+        检验某个数值列是否服从常见分布（正态、均匀、指数、对数正态、伽马）。
+        返回分箱观测数据 + 各候选分布的 Kolmogorov–Smirnov 拟合优度（统计量、p 值、估计参数）。
+
+        使用情景：
+        - 用户询问某列是否服从正态分布 / 某种分布，或需要判断分布形态以选择建模/变换策略
+
+        说明：候选分布固定由后端决定，调用方只需给出列名；p 值越大越无法拒绝该分布假设。
+        不要使用此工具进行描述性统计或相关性分析。
+        """
+        df = data.get(state["data_version"])
+        result = json.dumps(distribution_evaluation(df, column), ensure_ascii=False)
+        return result
+
+    return [
+        explore_schema,
+        correlation_analysis,
+        descriptive_analysis,
+        distribution_analysis_raw,
+        distribution_fit,
+    ]

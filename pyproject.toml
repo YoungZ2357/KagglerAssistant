@@ -17,6 +17,7 @@ dependencies = [
     "polars",
     "polars_ds",
     "numpy",
+    "scipy>=1.9",
     "python-dotenv",
     "textual",
     "scikit-learn",

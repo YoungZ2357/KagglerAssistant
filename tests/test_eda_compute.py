@@ -7,10 +7,13 @@ from kaggler.modes.eda.compute import (
     _pearson_batch,
     _cramers_v,
     _eta_squared,
+    _box_data_raw,
+    BinnedColumn,
     get_correlation,
     get_schema_report,
     get_descriptive_statistics,
     get_boxed_data,
+    distribution_evaluation,
 )
 
 
@@ -316,3 +319,85 @@ class TestBoxedData:
         result = get_boxed_data(df, "val", bins=3)
         assert result["null_count"] == 3
         assert result["total"] == 3
+
+
+class TestBoxDataRaw:
+    def test_fixed_length_includes_empty_bins(self):
+        # 10,12,13,20,50 → 4 个箱，中间两箱计数为 0，但不可被丢弃。
+        df = pl.DataFrame({"x": [10, 12, 13, 20, 50]})
+        raw = _box_data_raw(df, "x", bins=4)
+        assert isinstance(raw, BinnedColumn)
+        assert len(raw.counts) == 4
+        assert len(raw.edges) == 5
+        assert raw.counts == [4, 0, 0, 1]
+
+    def test_invariant_counts_exclude_nulls(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, None]})
+        raw = _box_data_raw(df, "x", bins=3)
+        assert raw.total == 5
+        assert raw.null_count == 1
+        assert sum(raw.counts) == raw.total - raw.null_count == 4
+
+    def test_constant_column_single_bin(self):
+        df = pl.DataFrame({"x": [7.0, 7.0, 7.0]})
+        raw = _box_data_raw(df, "x", bins=5)
+        assert raw.min_val == raw.max_val == 7.0
+        assert raw.counts == [3]
+
+    def test_all_null_empty(self):
+        df = pl.DataFrame({"x": [None, None]}, schema={"x": pl.Float64})
+        raw = _box_data_raw(df, "x")
+        assert raw.edges == [] and raw.counts == []
+        assert raw.min_val is None
+
+    def test_rejects_non_numeric(self):
+        df = pl.DataFrame({"c": ["a", "b"]})
+        with pytest.raises(ValueError):
+            _box_data_raw(df, "c")
+
+    def test_rejects_bad_bins(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        with pytest.raises(ValueError):
+            _box_data_raw(df, "x", bins=0)
+
+
+class TestDistributionEvaluation:
+    def test_normal_data_not_rejected_beats_uniform(self):
+        rng = __import__("numpy").random.default_rng(42)
+        df = pl.DataFrame({"v": rng.normal(100, 15, 400).tolist()})
+        result = distribution_evaluation(df, "v")
+        pvals = {c["distribution"]: c["p_value"] for c in result["fit"]["candidates"]}
+        # 正态数据：正态候选不应被拒绝，且 p 值显著高于均匀/指数候选。
+        # （注：全正数据下 gamma/lognormal 亦可良好拟合，故不断言 best_fit 恰为 normal。）
+        assert pvals["normal"] > 0.05
+        assert pvals["normal"] > pvals["uniform"]
+        assert pvals["normal"] > pvals["exponential"]
+
+    def test_includes_observation(self):
+        df = pl.DataFrame({"v": [float(i) for i in range(50)]})
+        result = distribution_evaluation(df, "v", bins=5)
+        assert result["observation"]["dtype"] == "numeric"
+        assert len(result["observation"]["bins"]) == 5
+
+    def test_positive_only_skipped_on_nonpositive(self):
+        rng = __import__("numpy").random.default_rng(0)
+        df = pl.DataFrame({"v": rng.normal(0, 5, 200).tolist()})  # 含负值
+        result = distribution_evaluation(df, "v")
+        skipped = {s["distribution"] for s in result["fit"].get("skipped", [])}
+        assert {"lognormal", "gamma"} <= skipped
+
+    def test_non_numeric_error(self):
+        df = pl.DataFrame({"c": ["a", "b", "c"]})
+        result = distribution_evaluation(df, "c")
+        assert "error" in result
+
+    def test_missing_column_error(self):
+        df = pl.DataFrame({"v": [1.0, 2.0]})
+        result = distribution_evaluation(df, "nope")
+        assert "error" in result
+
+    def test_insufficient_sample_skips_fit(self):
+        df = pl.DataFrame({"v": [1.0, 2.0, 3.0]})
+        result = distribution_evaluation(df, "v")
+        assert "error" in result["fit"]
+        assert "observation" in result  # 观测数据仍然返回

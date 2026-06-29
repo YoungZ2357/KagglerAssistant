@@ -53,6 +53,19 @@ packages = ["src/kaggler"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.coverage.run]
+# 排除在覆盖率统计之外的内容：
+# - app/tui/*：Textual TUI 展示层（事件循环 + 后台 worker 线程驱动 LLM 会话）。
+#   有意义的测试需重度 mock 异步/线程，脆弱且主要在测框架而非本项目逻辑，故按
+#   业界惯例将 UI 外壳排除；其下层逻辑（graph/modes/wrapper）另行覆盖。
+# - modes/common/compute.py、modes/modeling/*：尚未实现的占位桩（函数体多为
+#   ``pass``），待真正开发后再纳入统计。
+omit = [
+    "src/kaggler/app/tui/*",
+    "src/kaggler/modes/common/compute.py",
+    "src/kaggler/modes/modeling/*",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 88

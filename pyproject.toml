@@ -19,8 +19,9 @@ dependencies = [
     "numpy",
     "python-dotenv",
     "textual",
-
-    "scikit-learn"
+    "scikit-learn",
+    "pydantic",
+    "pydantic-settings"
 ]
 
 [project.optional-dependencies]

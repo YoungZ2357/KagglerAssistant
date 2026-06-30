@@ -6,7 +6,12 @@ from langchain_core.tools import BaseTool, tool, InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-from kaggler.modes.feature_engineering.compute import exec_empty, exec_encode
+from kaggler.modes.feature_engineering.compute import (
+    exec_dim_reduct,
+    exec_empty,
+    exec_encode,
+    exec_standardize,
+)
 from kaggler.persistence.data_provider import DataProvider
 
 
@@ -112,7 +117,128 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             ],
         })
 
+    @tool
+    def standardize_columns(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        columns: list[str],
+    ) -> Command:
+        """对指定的数值列执行 z-score 标准化（均值=0，标准差=1）。
+
+        columns 是一个列名字符串列表，所有列必须是数值类型且不含空值。
+        标准化会改变列值的尺度和分布，使不同量纲的特征可以直接比较。
+
+        使用情景：
+        - 在降维（PCA/LDA）或建模前，将不同量纲的特征统一到同一尺度
+        - 用户要求对某些列进行标准化时
+        - 特征量纲差异较大时，有助于提升模型表现
+        """
+        df = data.get(state["data_version"])
+        result = exec_standardize(df, columns)
+
+        if "error" in result:
+            return Command(update={
+                "messages": [
+                    ToolMessage(
+                        json.dumps(result, ensure_ascii=False),
+                        tool_call_id=tool_call_id,
+                    )
+                ],
+            })
+
+        new_version = data.add_version(result["processed_df"])
+        return Command(update={
+            "data_version": new_version,
+            "messages": [
+                ToolMessage(
+                    json.dumps({
+                        "new_data_version": new_version,
+                        "rows_before": result["rows_before"],
+                        "rows_after": result["rows_after"],
+                        "preview": result["preview"],
+                        "summary": result["summary"],
+                    }, ensure_ascii=False),
+                    tool_call_id=tool_call_id,
+                ),
+            ],
+        })
+
+    @tool
+    def execute_dim_reduct(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        method: str,
+        n_components: int,
+        target: str | None = None,
+        standardize: bool = True,
+    ) -> Command:
+        """执行数据降维，将多个数值特征压缩为少数主成分或判别分量。
+
+        支持两种方法，应用场景截然不同：
+        - "pca"：无监督主成分分析。适用于无标签数据，用于探索数据结构、
+          去噪、特征压缩和可视化。它寻找方差最大的投影方向，不利用任何标签信息。
+        - "lda"：有监督线性判别分析。适用于有标签/目标列的分类数据，在有监督
+          场景下寻找能最大化类间分离、最小化类内散布的投影方向。需要提供 target
+          参数指定目标列，且目标列需为分类列（至少 2 个类别）。
+
+        参数说明：
+        - method: "pca" 或 "lda"
+        - n_components: 降维后的维度数（正整数）
+        - target: LDA 必需的目标列名，PCA 时忽略
+        - standardize: 是否先对数值列做标准化，默认 True（推荐）
+
+        注意事项：
+        - 降维会替换原有的数值列为新生成的分量列（PC1, PC2, ... 或 LD1, LD2, ...）
+        - 非数值列以及 LDA 的 target 列会被保留
+        - 数值列中不能有 NaN，建议先使用 execute_empty_value 处理空值
+        - PCA 的 n_components 不能超过数值列数
+        - LDA 的 n_components 不能超过 min(类别数-1, 数值特征列数)
+
+        使用情景：
+        - 特征数量太多导致模型过拟合或训练缓慢时
+        - 需要消除特征间的多重共线性时
+        - 希望在保留主要信息的同时降低数据维度时
+        - 数据有标签且希望利用标签信息优化降维效果时（选 lda）
+        """
+        df = data.get(state["data_version"])
+        result = exec_dim_reduct(
+            df,
+            method=method,
+            n_components=n_components,
+            target=target,
+            standardize=standardize,
+        )
+
+        if "error" in result:
+            return Command(update={
+                "messages": [
+                    ToolMessage(
+                        json.dumps(result, ensure_ascii=False),
+                        tool_call_id=tool_call_id,
+                    )
+                ],
+            })
+
+        new_version = data.add_version(result["processed_df"])
+        return Command(update={
+            "data_version": new_version,
+            "messages": [
+                ToolMessage(
+                    json.dumps({
+                        "new_data_version": new_version,
+                        "rows_before": result["rows_before"],
+                        "rows_after": result["rows_after"],
+                        "preview": result["preview"],
+                        "summary": result["summary"],
+                    }, ensure_ascii=False),
+                    tool_call_id=tool_call_id,
+                ),
+            ],
+        })
+
     return [
         execute_empty_value,
         encode_columns,
+        standardize_columns,
+        execute_dim_reduct,
     ]

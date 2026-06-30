@@ -1,7 +1,15 @@
+import numpy as np
 import polars as pl
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from kaggler.shared.serialization import safe_val
-from kaggler.modes.feature_engineering.types import FillMethod, EncodeMethod
+from kaggler.modes.feature_engineering.types import (
+    DimReductMethod,
+    EncodeMethod,
+    FillMethod,
+)
 
 
 def exec_empty(
@@ -148,7 +156,7 @@ def exec_empty(
     }
 
 
-ONE_HOT_CARDINALITY_WARN = 20
+ONE_HOT_CARDINALITY_WARN = 10
 
 
 def exec_encode(
@@ -302,4 +310,252 @@ def exec_encode(
         "summary": summary,
         "rows_before": df.height,
         "rows_after": result_df.height,
+    }
+
+
+def standardize_numeric(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    arr = df.select(columns).to_numpy()
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(arr)
+    result = df.clone()
+    for i, col in enumerate(columns):
+        result = result.with_columns(pl.Series(col, scaled[:, i]))
+    return result
+
+
+def exec_standardize(
+    df: pl.DataFrame,
+    columns: list[str],
+) -> dict:
+    schema = df.schema
+    columns_set = set(schema.names())
+
+    unknown = [c for c in columns if c not in columns_set]
+    if unknown:
+        return {
+            "error": f"以下列名不存在：{unknown}",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+
+    non_numeric = [c for c in columns if not schema[c].is_numeric()]
+    if non_numeric:
+        return {
+            "error": f"以下列不是数值类型，无法标准化：{non_numeric}",
+        }
+
+    null_columns = [c for c in columns if df[c].null_count() > 0]
+    if null_columns:
+        return {
+            "error": f"以下列存在空值，请先使用 execute_empty_value 处理：{null_columns}",
+        }
+
+    result_df = standardize_numeric(df, columns)
+
+    preview_rows = result_df.head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+
+    summary = [{
+        "columns": columns,
+        "description": "z-score标准化（均值=0，标准差=1）",
+    }]
+
+    return {
+        "processed_df": result_df,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
+
+
+def exec_dim_reduct(
+    df: pl.DataFrame,
+    method: str,
+    n_components: int,
+    target: str | None = None,
+    standardize: bool = True,
+) -> dict:
+    try:
+        method_enum = DimReductMethod(method)
+    except ValueError:
+        return {
+            "error": f"未知的降维方法: {method}",
+            "hint": "支持的方法: pca, lda",
+        }
+
+    if n_components < 1:
+        return {
+            "error": f"n_components 必须为正整数，当前值: {n_components}",
+        }
+
+    schema = df.schema
+
+    if method_enum == DimReductMethod.PCA:
+        numeric_cols = [c for c, d in schema.items() if d.is_numeric()]
+        if not numeric_cols:
+            return {"error": "数据集中没有数值列，无法进行PCA降维"}
+        if n_components > len(numeric_cols):
+            return {
+                "error": (
+                    f"n_components ({n_components}) 超过数值列数"
+                    f" ({len(numeric_cols)})"
+                ),
+            }
+
+        working_df = df.clone()
+        if standardize:
+            working_df = standardize_numeric(working_df, numeric_cols)
+
+        arr = working_df.select(numeric_cols).to_numpy()
+        if np.any(np.isnan(arr)):
+            return {
+                "error": "数值列中存在 NaN 值，请先使用 execute_empty_value 处理空值",
+            }
+
+        pca = PCA(n_components=n_components)
+        transformed = pca.fit_transform(arr)
+        if transformed.ndim == 1:
+            transformed = transformed.reshape(-1, 1)
+
+        pc_cols = [f"PC{i + 1}" for i in range(n_components)]
+        final_cols = [c for c in df.columns if c not in numeric_cols] + pc_cols
+
+        drop_cols = [c for c, d in schema.items() if c in numeric_cols]
+        result_df = df.clone().drop(drop_cols)
+        pc_df = pl.from_numpy(transformed, schema=pc_cols)
+        dupes = [c for c in pc_cols if c in result_df.columns]
+        if dupes:
+            result_df = result_df.drop(dupes)
+        result_df = result_df.hstack(pc_df)
+        result_df = result_df.select(final_cols)
+
+        preview_rows = result_df.head(3).to_dicts()
+        preview = [
+            {k: safe_val(v) for k, v in row.items()} for row in preview_rows
+        ]
+
+        summary = [{
+            "method": "pca",
+            "n_components": n_components,
+            "original_features": numeric_cols,
+            "new_columns": pc_cols,
+            "explained_variance_ratio": [
+                round(float(v), 6) for v in pca.explained_variance_ratio_
+            ],
+            "standardized": standardize,
+        }]
+
+        return {
+            "processed_df": result_df,
+            "preview": preview,
+            "summary": summary,
+            "rows_before": df.height,
+            "rows_after": result_df.height,
+        }
+
+    if method_enum == DimReductMethod.LDA:
+        if target is None:
+            return {"error": "LDA 降维需要指定 target 目标列名"}
+        if target not in schema.names():
+            return {"error": f"目标列 '{target}' 不存在"}
+
+        numeric_cols = [
+            c for c, d in schema.items() if d.is_numeric() and c != target
+        ]
+        if not numeric_cols:
+            return {
+                "error": "数据集中除目标列外没有数值特征列，无法进行LDA降维",
+            }
+
+        target_null_count = df[target].null_count()
+        df_clean = (
+            df.filter(pl.col(target).is_not_null())
+            if target_null_count > 0
+            else df.clone()
+        )
+        rows_dropped = df.height - df_clean.height
+
+        target_vals = df_clean[target].drop_nulls().unique()
+        n_classes = target_vals.len()
+        if n_classes < 2:
+            return {
+                "error": (
+                    f"目标列 '{target}' 只有 {n_classes} 个类别，LDA 需要至少 2 个类别"
+                ),
+            }
+
+        max_components = min(n_classes - 1, len(numeric_cols))
+        if n_components > max_components:
+            return {
+                "error": (
+                    f"n_components ({n_components}) 超过最大允许值"
+                    f" ({max_components})，LDA 最大分量数 = min(类别数-1, 特征数)"
+                ),
+            }
+
+        working_df = df_clean.clone()
+        if standardize:
+            working_df = standardize_numeric(working_df, numeric_cols)
+
+        X = working_df.select(numeric_cols).to_numpy()
+        if np.any(np.isnan(X)):
+            return {
+                "error": "数值特征列中存在 NaN 值，请先使用 execute_empty_value 处理空值",
+            }
+
+        y = df_clean[target].to_numpy()
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y.astype(str))
+
+        lda = LinearDiscriminantAnalysis(n_components=n_components)
+        transformed = lda.fit_transform(X, y_encoded)
+        if transformed.ndim == 1:
+            transformed = transformed.reshape(-1, 1)
+        if transformed.shape[1] == 0:
+            return {
+                "error": (
+                    "LDA 未能提取有效分量，可能是因为数据量过少或类内散布矩阵奇异。"
+                    "建议增加样本量或减少 n_components。"
+                ),
+            }
+
+        ld_cols = [f"LD{i + 1}" for i in range(n_components)]
+        keep_cols = [c for c in df.columns if c not in numeric_cols]
+        final_cols = keep_cols + ld_cols
+
+        result_df = df_clean.clone().drop(numeric_cols)
+        ld_df = pl.from_numpy(transformed, schema=ld_cols)
+        dupes = [c for c in ld_cols if c in result_df.columns]
+        if dupes:
+            result_df = result_df.drop(dupes)
+        result_df = result_df.hstack(ld_df)
+        result_df = result_df.select(final_cols)
+
+        preview_rows = result_df.head(3).to_dicts()
+        preview = [
+            {k: safe_val(v) for k, v in row.items()} for row in preview_rows
+        ]
+
+        summary = [{
+            "method": "lda",
+            "n_components": n_components,
+            "target": target,
+            "original_features": numeric_cols,
+            "new_columns": ld_cols,
+            "n_classes": n_classes,
+            "standardized": standardize,
+            "rows_dropped": rows_dropped,
+        }]
+
+        return {
+            "processed_df": result_df,
+            "preview": preview,
+            "summary": summary,
+            "rows_before": df.height,
+            "rows_after": result_df.height,
+        }
+
+    return {
+        "error": f"未知的降维方法: {method}",
+        "hint": "支持的方法: pca, lda",
     }

@@ -12,3 +12,8 @@ class FillMethod(str, Enum):
 class EncodeMethod(str, Enum):
     ONE_HOT = "one_hot"
     LABEL = "label"
+
+
+class DimReductMethod(str, Enum):
+    PCA = "pca"
+    LDA = "lda"

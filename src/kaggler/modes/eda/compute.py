@@ -1,32 +1,12 @@
 import itertools
 import math
 from dataclasses import dataclass
-from math import isnan, isinf
 
 import numpy as np
 import polars as pl
 from scipy import stats
 
-
-# 帮手函数 #################################################################
-def _safe_val(v):
-    """
-    [HUMAN]将Polars值转化为安全的Python原生类型，以便于序列化
-    Args:
-        v: Polars内的数据值，可能为多种类型
-
-    Returns:
-
-    """
-    if v is None:
-        return None
-    if isinstance(v, float):
-        if isnan(v) or isinf(v):
-            return None
-        return round(v, 6)
-    if hasattr(v, "__int__") and not isinstance(v, (bool, str)):
-        return int(v)
-    return str(v)
+from kaggler.shared.serialization import safe_val
 
 
 # def _dumps(obj: dict | list) -> str:
@@ -50,7 +30,7 @@ def _pearson_batch(
         pl.corr(a, b, method="pearson").alias(str(i))
         for i, (a, b) in enumerate(pairs)
     ]).row(0)
-    return [_safe_val(v) for v in values]
+    return [safe_val(v) for v in values]
 
 def _cramers_v(df: pl.DataFrame, col_a: str, col_b: str) -> float | None:
     """
@@ -223,7 +203,7 @@ def _render_numeric_observation(raw: BinnedColumn) -> dict:
         lo, hi = raw.edges[i], raw.edges[i + 1]
         # 首箱左闭右闭，其余左开右闭，与 _box_data_raw 的切分语义一致。
         left = "[" if i == 0 else "("
-        label = f"{left}{_safe_val(lo)}, {_safe_val(hi)}]"
+        label = f"{left}{safe_val(lo)}, {safe_val(hi)}]"
         bin_list.append({"bin": label, "count": count})
 
     return {
@@ -231,8 +211,8 @@ def _render_numeric_observation(raw: BinnedColumn) -> dict:
         "dtype": "numeric",
         "total": raw.total,
         "null_count": raw.null_count,
-        "min_val": _safe_val(raw.min_val),
-        "max_val": _safe_val(raw.max_val),
+        "min_val": safe_val(raw.min_val),
+        "max_val": safe_val(raw.max_val),
         "bins": bin_list,
     }
 
@@ -288,7 +268,7 @@ def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
     if len(categorical_cols) >= 2:
         results["cramers_v"] = sorted(
             [
-                {"column_a": a, "column_b": b, "value": _safe_val(_cramers_v(df, a, b))}
+                {"column_a": a, "column_b": b, "value": safe_val(_cramers_v(df, a, b))}
                 for a, b in itertools.combinations(categorical_cols, 2)
             ],
             key=lambda p: abs(p["value"] or 0),
@@ -299,7 +279,7 @@ def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
     if categorical_cols and numeric_cols:
         results["eta_squared"] = sorted(
             [
-                {"column_a": cat, "column_b": num, "value": _safe_val(_eta_squared(df, cat, num))}
+                {"column_a": cat, "column_b": num, "value": safe_val(_eta_squared(df, cat, num))}
                 for cat in categorical_cols
                 for num in numeric_cols
             ],
@@ -354,7 +334,7 @@ def get_schema_report(df: pl.DataFrame) -> dict:
     for name, dtype in zip(col_names, dtypes):
         null_cnt = int(stats_df[0, f"null_{name}"])
         unique_cnt = int(stats_df[0, f"unique_{name}"])
-        samples = [_safe_val(v) for v in head_df[name].to_list()]
+        samples = [safe_val(v) for v in head_df[name].to_list()]
         columns.append({
             "name": name,
             "dtype": str(dtype),
@@ -413,15 +393,15 @@ def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
     for col in numeric_cols:
         results.append({
             "column": col,
-            "count": _safe_val(stats_row[0, f"{col}__count"]),
-            "null_count": _safe_val(stats_row[0, f"{col}__null_count"]),
-            "mean": _safe_val(stats_row[0, f"{col}__mean"]),
-            "median": _safe_val(stats_row[0, f"{col}__median"]),
-            "std": _safe_val(stats_row[0, f"{col}__std"]),
-            "min": _safe_val(stats_row[0, f"{col}__min"]),
-            "q1": _safe_val(stats_row[0, f"{col}__q1"]),
-            "q3": _safe_val(stats_row[0, f"{col}__q3"]),
-            "max": _safe_val(stats_row[0, f"{col}__max"]),
+            "count": safe_val(stats_row[0, f"{col}__count"]),
+            "null_count": safe_val(stats_row[0, f"{col}__null_count"]),
+            "mean": safe_val(stats_row[0, f"{col}__mean"]),
+            "median": safe_val(stats_row[0, f"{col}__median"]),
+            "std": safe_val(stats_row[0, f"{col}__std"]),
+            "min": safe_val(stats_row[0, f"{col}__min"]),
+            "q1": safe_val(stats_row[0, f"{col}__q1"]),
+            "q3": safe_val(stats_row[0, f"{col}__q3"]),
+            "max": safe_val(stats_row[0, f"{col}__max"]),
         })
 
     output = {"stats": results}
@@ -464,7 +444,7 @@ def get_boxed_data(df: pl.DataFrame, column: str, bins: int = 10) -> dict:
         for row in freq_df.iter_rows(named=True):
             cnt = int(row["count"])
             freq_list.append({
-                "value": _safe_val(row[column]),
+                "value": safe_val(row[column]),
                 "count": cnt,
                 "proportion": round(cnt / total, 4) if total else 0,
             })
@@ -583,11 +563,11 @@ def _chi_square_fit(name: str, dist, values: np.ndarray, raw: BinnedColumn) -> d
     p_value = float(stats.chi2.sf(statistic, dof))
     return {
         "distribution": name,
-        "statistic": _safe_val(statistic),
+        "statistic": safe_val(statistic),
         "dof": dof,
-        "p_value": _safe_val(p_value),
+        "p_value": safe_val(p_value),
         "params": {
-            k: _safe_val(float(v)) for k, v in zip(_param_names(dist), params)
+            k: safe_val(float(v)) for k, v in zip(_param_names(dist), params)
         },
     }
 
@@ -609,10 +589,10 @@ def _monte_carlo_fit(name: str, dist, values: np.ndarray) -> dict:
     )
     return {
         "distribution": name,
-        "statistic": _safe_val(float(res.statistic)),
-        "p_value": _safe_val(float(res.pvalue)),
+        "statistic": safe_val(float(res.statistic)),
+        "p_value": safe_val(float(res.pvalue)),
         "params": {
-            k: _safe_val(float(v))
+            k: safe_val(float(v))
             for k, v in res.fit_result.params._asdict().items()
         },
     }

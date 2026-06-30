@@ -2,8 +2,8 @@
 import polars as pl
 import pytest
 
+from kaggler.shared.serialization import safe_val
 from kaggler.modes.eda.compute import (
-    _safe_val,
     _pearson_batch,
     _cramers_v,
     _eta_squared,
@@ -19,29 +19,29 @@ from kaggler.modes.eda.compute import (
 
 class TestSafeVal:
     def test_none(self):
-        assert _safe_val(None) is None
+        assert safe_val(None) is None
 
     def test_nan(self):
-        assert _safe_val(float("nan")) is None
+        assert safe_val(float("nan")) is None
 
     def test_inf(self):
-        assert _safe_val(float("inf")) is None
-        assert _safe_val(float("-inf")) is None
+        assert safe_val(float("inf")) is None
+        assert safe_val(float("-inf")) is None
 
     def test_float_normal(self):
-        assert _safe_val(3.1415926535) == 3.141593
-        assert _safe_val(1.0) == 1.0
+        assert safe_val(3.1415926535) == 3.141593
+        assert safe_val(1.0) == 1.0
 
     def test_int(self):
-        assert _safe_val(42) == 42
-        assert isinstance(_safe_val(42), int)
+        assert safe_val(42) == 42
+        assert isinstance(safe_val(42), int)
 
     def test_bool(self):
-        assert _safe_val(True) == "True"
-        assert _safe_val(False) == "False"
+        assert safe_val(True) == "True"
+        assert safe_val(False) == "False"
 
     def test_str(self):
-        assert _safe_val("hello") == "hello"
+        assert safe_val("hello") == "hello"
 
 
 class TestPearsonBatch:

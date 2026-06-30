@@ -12,3 +12,8 @@ class DataProvider:
             raise RuntimeError(f"数据版本 `{data_version}` 不存在")
         return self._frames[data_version]
 
+    def add_version(self, df: pl.DataFrame) -> int:
+        new_version = max(self._frames.keys(), default=-1) + 1
+        self._frames[new_version] = df
+        return new_version
+

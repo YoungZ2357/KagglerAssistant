@@ -314,6 +314,8 @@ def exec_encode(
 
 
 def standardize_numeric(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    if not columns:
+        return df.clone()
     arr = df.select(columns).to_numpy()
     scaler = StandardScaler()
     scaled = scaler.fit_transform(arr)
@@ -423,10 +425,13 @@ def exec_dim_reduct(
         drop_cols = [c for c, d in schema.items() if c in numeric_cols]
         result_df = df.clone().drop(drop_cols)
         pc_df = pl.from_numpy(transformed, schema=pc_cols)
-        dupes = [c for c in pc_cols if c in result_df.columns]
-        if dupes:
-            result_df = result_df.drop(dupes)
-        result_df = result_df.hstack(pc_df)
+        if result_df.width == 0:
+            result_df = pc_df
+        else:
+            dupes = [c for c in pc_cols if c in result_df.columns]
+            if dupes:
+                result_df = result_df.drop(dupes)
+            result_df = result_df.hstack(pc_df)
         result_df = result_df.select(final_cols)
 
         preview_rows = result_df.head(3).to_dicts()
@@ -519,16 +524,21 @@ def exec_dim_reduct(
                 ),
             }
 
+        n_components = transformed.shape[1]
+
         ld_cols = [f"LD{i + 1}" for i in range(n_components)]
         keep_cols = [c for c in df.columns if c not in numeric_cols]
         final_cols = keep_cols + ld_cols
 
         result_df = df_clean.clone().drop(numeric_cols)
         ld_df = pl.from_numpy(transformed, schema=ld_cols)
-        dupes = [c for c in ld_cols if c in result_df.columns]
-        if dupes:
-            result_df = result_df.drop(dupes)
-        result_df = result_df.hstack(ld_df)
+        if result_df.width == 0:
+            result_df = ld_df
+        else:
+            dupes = [c for c in ld_cols if c in result_df.columns]
+            if dupes:
+                result_df = result_df.drop(dupes)
+            result_df = result_df.hstack(ld_df)
         result_df = result_df.select(final_cols)
 
         preview_rows = result_df.head(3).to_dicts()

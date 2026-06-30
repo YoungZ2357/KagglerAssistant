@@ -1,7 +1,7 @@
 import polars as pl
 import pytest
 
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 class TestDataProvider:

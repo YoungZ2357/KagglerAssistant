@@ -11,7 +11,7 @@ from kaggler.modes.eda.compute import (
     get_descriptive_statistics,
     get_schema_report,
 )
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 def make_tools(data: DataProvider) -> list[BaseTool]:
     """

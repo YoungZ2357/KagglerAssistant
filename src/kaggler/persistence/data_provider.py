@@ -17,6 +17,7 @@ class DataProvider:
         self._frames[new_version] = df
         return new_version
 
-    def persist_version(self, version: int) -> None:
-        pass
+    # def persist_version(self, version: int, name: str) -> None:
+    # 需要工作区系统才能实现
+    #     pass
 

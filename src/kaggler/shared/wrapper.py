@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
 from kaggler.shared.types import Mode
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 class AgentSession:

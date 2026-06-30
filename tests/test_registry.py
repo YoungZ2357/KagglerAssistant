@@ -3,7 +3,7 @@ from langchain_core.tools import BaseTool
 
 from kaggler.modes.registry import REGISTRY, ModeSpec
 from kaggler.shared.types import Mode
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 class TestRegistry:

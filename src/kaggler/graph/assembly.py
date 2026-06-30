@@ -17,7 +17,7 @@ from kaggler.modes.common.tools import make_tools as make_common_tools
 from kaggler.modes.registry import REGISTRY
 from kaggler.shared.config import GraphConfig, make_llm_raw, DeepSeekModel
 from kaggler.shared.types import Mode
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 def build_graph(

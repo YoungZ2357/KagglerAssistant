@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
 from kaggler.shared.config import GraphConfig
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 @pytest.fixture

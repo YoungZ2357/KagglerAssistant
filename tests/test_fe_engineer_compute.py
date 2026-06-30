@@ -1,6 +1,10 @@
 import polars as pl
 
-from kaggler.modes.feature_engineering.compute import exec_empty as execute_empty_value
+from kaggler.modes.feature_engineering.compute import (
+    exec_empty as execute_empty_value,
+    exec_encode as execute_encode,
+    ONE_HOT_CARDINALITY_WARN,
+)
 
 
 class TestExecuteEmptyValue:
@@ -172,3 +176,135 @@ class TestExecuteEmptyValue:
             {"column": "b", "action": "delete"},
         ])
         assert result["processed_df"].height == 1
+
+
+class TestExecEncode:
+    def test_one_hot_basic(self):
+        df = pl.DataFrame({"color": ["red", "blue", "red", "green"]})
+        result = execute_encode(df, [{"column": "color", "action": "one_hot"}])
+        assert "error" not in result
+        processed = result["processed_df"]
+        assert "color" not in processed.columns
+        assert len(processed.columns) == 2
+        assert processed["color_blue"].to_list() == [False, True, False, False]
+        assert processed["color_green"].to_list() == [False, False, False, True]
+        assert result["rows_after"] == 4
+
+    def test_one_hot_binary_drop_first(self):
+        df = pl.DataFrame({"x": ["a", "b", "a", "a"]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        processed = result["processed_df"]
+        assert "x" not in processed.columns
+        assert len(processed.columns) == 1
+        assert processed["x_b"].to_list() == [False, True, False, False]
+
+    def test_one_hot_single_value_warns(self):
+        df = pl.DataFrame({"x": ["a", "a", "a"]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        summary = result["summary"][0]
+        assert "仅有一个唯一值" in str(summary["warnings"])
+        assert summary["new_columns"] == []
+        assert "x" not in result["processed_df"].columns
+
+    def test_one_hot_with_nulls(self):
+        df = pl.DataFrame({"x": ["a", "b", None, "a"]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        processed = result["processed_df"]
+        assert "x" not in processed.columns
+        assert processed.row(2, named=True) == {"x_b": None}
+
+    def test_one_hot_all_nulls(self):
+        df = pl.DataFrame({"x": [None, None]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        summary = result["summary"][0]
+        assert "全部为空值" in str(summary["warnings"])
+        assert summary["new_columns"] == []
+        assert "x" not in result["processed_df"].columns
+
+    def test_one_hot_high_cardinality_warns(self):
+        vals = [str(i) for i in range(ONE_HOT_CARDINALITY_WARN + 1)]
+        df = pl.DataFrame({"x": vals})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        assert any("稀疏" in w for w in result["summary"][0]["warnings"])
+        assert "error" not in result
+
+    def test_label_basic(self):
+        df = pl.DataFrame({"size": ["medium", "small", "large", "small"]})
+        result = execute_encode(df, [{"column": "size", "action": "label"}])
+        processed = result["processed_df"]
+        assert processed["size"].dtype == pl.Int64
+        assert processed["size"].to_list() == [1, 2, 0, 2]
+        assert result["summary"][0]["mapping"] == {"large": 0, "medium": 1, "small": 2}
+
+    def test_label_with_nulls(self):
+        df = pl.DataFrame({"x": ["b", None, "a", "b"]})
+        result = execute_encode(df, [{"column": "x", "action": "label"}])
+        processed = result["processed_df"]
+        assert processed["x"].to_list() == [1, None, 0, 1]
+        assert result["summary"][0]["mapping"] == {"a": 0, "b": 1}
+
+    def test_label_numeric_column(self):
+        df = pl.DataFrame({"x": [30, 10, 20, 10]})
+        result = execute_encode(df, [{"column": "x", "action": "label"}])
+        processed = result["processed_df"]
+        assert processed["x"].dtype == pl.Int64
+        assert processed["x"].to_list() == [2, 0, 1, 0]
+        assert result["summary"][0]["mapping"] == {"10": 0, "20": 1, "30": 2}
+
+    def test_label_boolean_column(self):
+        df = pl.DataFrame({"x": [True, False, True, False]})
+        result = execute_encode(df, [{"column": "x", "action": "label"}])
+        processed = result["processed_df"]
+        assert processed["x"].dtype == pl.Int64
+        assert processed["x"].to_list() == [1, 0, 1, 0]
+        assert result["summary"][0]["mapping"] == {"False": 0, "True": 1}
+
+    def test_label_all_nulls(self):
+        df = pl.DataFrame({"x": [None, None]})
+        result = execute_encode(df, [{"column": "x", "action": "label"}])
+        assert "error" not in result
+        assert "全部为空值" in str(result["summary"][0]["warnings"])
+        assert result["processed_df"]["x"].null_count() == 2
+
+    def test_mixed_encodings(self):
+        df = pl.DataFrame({
+            "color": ["red", "blue", "red"],
+            "size": ["L", "M", "S"],
+        })
+        result = execute_encode(df, [
+            {"column": "color", "action": "one_hot"},
+            {"column": "size", "action": "label"},
+        ])
+        processed = result["processed_df"]
+        assert "color" not in processed.columns
+        assert "size" in processed.columns
+        assert processed["size"].dtype == pl.Int64
+        assert result["rows_after"] == 3
+
+    def test_unknown_column(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_encode(df, [{"column": "zzz", "action": "one_hot"}])
+        assert "error" in result
+
+    def test_unknown_action(self):
+        df = pl.DataFrame({"a": [1, 2]})
+        result = execute_encode(df, [{"column": "a", "action": "unknown"}])
+        assert "error" in result
+
+    def test_preview_contains_three_rows(self):
+        df = pl.DataFrame({"x": ["a", "b", "c", "d", "e"]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        assert len(result["preview"]) == 3
+
+    def test_preview_serializes_safe(self):
+        df = pl.DataFrame({"x": ["a", "b", "c"]})
+        result = execute_encode(df, [{"column": "x", "action": "one_hot"}])
+        for row in result["preview"]:
+            for v in row.values():
+                assert isinstance(v, (str, int, type(None)))
+
+    def test_rows_unchanged(self):
+        df = pl.DataFrame({"x": ["a", "b", "c", "a"]})
+        result = execute_encode(df, [{"column": "x", "action": "label"}])
+        assert result["rows_before"] == 4
+        assert result["rows_after"] == 4

@@ -17,3 +17,6 @@ class DataProvider:
         self._frames[new_version] = df
         return new_version
 
+    def persist_version(self, version: int) -> None:
+        pass
+

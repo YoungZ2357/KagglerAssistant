@@ -7,3 +7,8 @@ class FillMethod(str, Enum):
     AVG = "avg"
     MODE = "mode"
     DELETE = "delete"
+
+
+class EncodeMethod(str, Enum):
+    ONE_HOT = "one_hot"
+    LABEL = "label"

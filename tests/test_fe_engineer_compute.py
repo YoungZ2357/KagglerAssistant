@@ -1,6 +1,6 @@
 import polars as pl
 
-from kaggler.modes.feature_engineering.compute import execute_empty_value
+from kaggler.modes.feature_engineering.compute import exec_empty as execute_empty_value
 
 
 class TestExecuteEmptyValue:

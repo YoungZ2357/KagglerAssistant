@@ -12,7 +12,7 @@ def make_tools() -> list[BaseTool]:
     @tool
     def switch_mode(
             new_mode: Mode,
-            tool_call_id: Annotated[dict, InjectedToolCallId]
+            tool_call_id: Annotated[str, InjectedToolCallId]
             # state: Annotated[dict, InjectedState]
     ) -> Command:
         """切换当前工作模式（mode）。

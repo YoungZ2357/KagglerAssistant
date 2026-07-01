@@ -1,7 +1,5 @@
-import json
 from typing import Annotated
 
-from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool, InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
@@ -12,7 +10,13 @@ from kaggler.modes.feature_engineering.compute import (
     exec_encode,
     exec_standardize,
 )
+from kaggler.modes.feature_engineering.types import (
+    DimReductMethod,
+    EncodePair,
+    FillPair,
+)
 from kaggler.persistence.data_provider import DataProvider
+from kaggler.shared.tool_helpers import commit_mutation
 
 
 def make_tools(data: DataProvider) -> list[BaseTool]:
@@ -21,12 +25,11 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
     def execute_empty_value(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
-        pairs: list[dict],
+        pairs: list[FillPair],
     ) -> Command:
         """对指定列执行空值填充或删除操作。如果你的信息有限，你可以尝试少量多次使用。
 
-        pairs 是一个列表，每个元素为 {"column": <列名>, "action": <填充方法>}。
-        支持的 action 值：
+        pairs 是列-方法对的列表，每项指定一列的处理方式。支持的 action：
         - "zero"：用零值填充（数值填 0，字符串填 "0"，布尔填 False）
         - "avg"：用均值填充（仅限数值列）
         - "median"：用中位数填充（仅限数值列）
@@ -39,45 +42,18 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         - 当你拥有足够自主权，且认为需要对数据进行相关处理
         """
         df = data.get(state["data_version"])
-        result = exec_empty(df, pairs)
-
-        if "error" in result:
-            return Command(update={
-                "messages": [
-                    ToolMessage(
-                        json.dumps(result, ensure_ascii=False),
-                        tool_call_id=tool_call_id,
-                    )
-                ],
-            })
-
-        new_version = data.add_version(result["processed_df"])
-        return Command(update={
-            "data_version": new_version,
-            "messages": [
-                ToolMessage(
-                    json.dumps({
-                        "new_data_version": new_version,
-                        "rows_before": result["rows_before"],
-                        "rows_after": result["rows_after"],
-                        "preview": result["preview"],
-                        "summary": result["summary"],
-                    }, ensure_ascii=False),
-                    tool_call_id=tool_call_id,
-                ),
-            ],
-        })
+        result = exec_empty(df, [p.model_dump(mode="json") for p in pairs])
+        return commit_mutation(data, result, tool_call_id)
 
     @tool
     def encode_columns(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
-        pairs: list[dict],
+        pairs: list[EncodePair],
     ) -> Command:
         """对指定列执行编码操作。如果你的信息有限，你可以尝试少量多次使用。
 
-        pairs 是一个列表，每个元素为 {"column": <列名>, "action": <编码方法>}。
-        支持的 action 值：
+        pairs 是列-方法对的列表，每项指定一列的编码方式。支持的 action：
         - "one_hot"：独热编码，强制丢弃第一类（drop_first），n 个唯一值生成 n-1 列。
           如果唯一值过多会给出警告但仍然执行。
         - "label"：标签编码，将类别值映射为整数。
@@ -88,34 +64,8 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         - 一次可以同时对多列使用不同编码方法
         """
         df = data.get(state["data_version"])
-        result = exec_encode(df, pairs)
-
-        if "error" in result:
-            return Command(update={
-                "messages": [
-                    ToolMessage(
-                        json.dumps(result, ensure_ascii=False),
-                        tool_call_id=tool_call_id,
-                    )
-                ],
-            })
-
-        new_version = data.add_version(result["processed_df"])
-        return Command(update={
-            "data_version": new_version,
-            "messages": [
-                ToolMessage(
-                    json.dumps({
-                        "new_data_version": new_version,
-                        "rows_before": result["rows_before"],
-                        "rows_after": result["rows_after"],
-                        "preview": result["preview"],
-                        "summary": result["summary"],
-                    }, ensure_ascii=False),
-                    tool_call_id=tool_call_id,
-                ),
-            ],
-        })
+        result = exec_encode(df, [p.model_dump(mode="json") for p in pairs])
+        return commit_mutation(data, result, tool_call_id)
 
     @tool
     def standardize_columns(
@@ -135,39 +85,13 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         df = data.get(state["data_version"])
         result = exec_standardize(df, columns)
-
-        if "error" in result:
-            return Command(update={
-                "messages": [
-                    ToolMessage(
-                        json.dumps(result, ensure_ascii=False),
-                        tool_call_id=tool_call_id,
-                    )
-                ],
-            })
-
-        new_version = data.add_version(result["processed_df"])
-        return Command(update={
-            "data_version": new_version,
-            "messages": [
-                ToolMessage(
-                    json.dumps({
-                        "new_data_version": new_version,
-                        "rows_before": result["rows_before"],
-                        "rows_after": result["rows_after"],
-                        "preview": result["preview"],
-                        "summary": result["summary"],
-                    }, ensure_ascii=False),
-                    tool_call_id=tool_call_id,
-                ),
-            ],
-        })
+        return commit_mutation(data, result, tool_call_id)
 
     @tool
     def execute_dim_reduct(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
-        method: str,
+        method: DimReductMethod,
         n_components: int,
         target: str | None = None,
         standardize: bool = True,
@@ -208,33 +132,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             target=target,
             standardize=standardize,
         )
-
-        if "error" in result:
-            return Command(update={
-                "messages": [
-                    ToolMessage(
-                        json.dumps(result, ensure_ascii=False),
-                        tool_call_id=tool_call_id,
-                    )
-                ],
-            })
-
-        new_version = data.add_version(result["processed_df"])
-        return Command(update={
-            "data_version": new_version,
-            "messages": [
-                ToolMessage(
-                    json.dumps({
-                        "new_data_version": new_version,
-                        "rows_before": result["rows_before"],
-                        "rows_after": result["rows_after"],
-                        "preview": result["preview"],
-                        "summary": result["summary"],
-                    }, ensure_ascii=False),
-                    tool_call_id=tool_call_id,
-                ),
-            ],
-        })
+        return commit_mutation(data, result, tool_call_id)
 
     return [
         execute_empty_value,

@@ -4,6 +4,7 @@ import polars as pl
 import pytest
 
 from kaggler.modes.feature_engineering.tools import make_tools
+from kaggler.modes.feature_engineering.types import EncodePair, FillPair
 from kaggler.persistence.data_provider import DataProvider
 
 
@@ -122,7 +123,7 @@ class TestMakeFeatEngTools:
         result_cmd = tool.func(
             state={"data_version": 0},
             tool_call_id="call_6",
-            pairs=[{"column": "x", "action": "zero"}],
+            pairs=[FillPair(column="x", action="zero")],
         )
         update = result_cmd.update
         assert update["data_version"] == 1
@@ -135,7 +136,7 @@ class TestMakeFeatEngTools:
         result_cmd = tool.func(
             state={"data_version": 0},
             tool_call_id="call_7",
-            pairs=[{"column": "cat", "action": "label"}],
+            pairs=[EncodePair(column="cat", action="label")],
         )
         update = result_cmd.update
         assert update["data_version"] == 1

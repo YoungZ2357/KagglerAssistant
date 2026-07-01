@@ -33,7 +33,7 @@ tools_by_mode = {
 }
 
 prompt_templates: dict[Mode, str] = {
-    mode: spec.prompt_templates
+    mode: spec.prompt
     for mode, spec in REGISTRY.items()
 }
 

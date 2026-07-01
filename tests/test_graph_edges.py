@@ -26,6 +26,18 @@ class TestEntryCondition:
         cfg = GraphConfig(summary_trigger_count=1)
         assert entry_condition(state, graph_config=cfg) == Node.REACT
 
+    def test_at_threshold_but_nothing_deletable_goes_react(self):
+        # #2：达阈值但仅 1 个进行中的巨型回合（cutoff=0）→ 跳过总结、直接 react，不空转
+        state = {
+            "messages": [
+                HumanMessage(content="q"),
+                AIMessage(content="a"),
+                ToolMessage(content="r", tool_call_id="t"),
+            ]
+        }
+        cfg = GraphConfig(summary_trigger_count=3, summary_keep_recent=4)
+        assert entry_condition(state, graph_config=cfg) == Node.REACT
+
 
 class TestRouteAfterAgent:
     def test_ai_with_tool_calls_goes_tools(self):

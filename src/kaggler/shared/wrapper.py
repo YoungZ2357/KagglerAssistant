@@ -44,6 +44,20 @@ class AgentSession:
             self._seeded = True
         return payload
 
+    def set_mode(self, mode: Mode) -> None:
+        """确定性切换模式（Channel A）：不经 LLM，直接写入图 state。
+
+        供 TUI 的 ``/switch`` 指令调用。若尚未首轮播种，则一并注入种子字段并翻转
+        ``_seeded``——否则下一次 ``_seed_payload`` 会再次注入 ``current_mode=EDA``
+        覆盖本次切换。``MemorySaver`` 下 ``update_state`` 会在该 thread 上创建/续写
+        checkpoint，之后 ``stream_events`` 从该 checkpoint 恢复，模式即生效。
+        """
+        values: dict = {"current_mode": mode}
+        if not self._seeded:
+            values |= {"file_path": self._csv_path, "data_version": 0}
+            self._seeded = True
+        self._graph.update_state(self._config, values)
+
     def stream_events(self, question: str) -> Iterator[dict[str, Any]]:
         """逐事件产出本轮过程，供 UI 同时驱动「回答」与「Agent 行为追溯」。
 

@@ -33,7 +33,9 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Header, Input, Label, RichLog, Static
 
+from kaggler.app.tui.commands import COMMANDS, SlashSuggester, parse
 from kaggler.app.tui.screens import FilePickerScreen
+from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
 
 _GREETINGS = ["请讲！", "快点把问题端上来罢", "冲刺！冲刺！冲！冲！"]
@@ -101,7 +103,10 @@ class KagglerTUI(App[None]):
                 yield RichLog(id="agent-trace", markup=False, highlight=False, wrap=True)
         with Vertical(id="bottom-bar"):
             yield Static("", id="status-bar")
-            yield Input(placeholder="> ", id="user-input", disabled=True)
+            yield Input(
+                placeholder="> ", id="user-input", disabled=True,
+                suggester=SlashSuggester(),
+            )
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     def on_mount(self) -> None:
@@ -192,6 +197,10 @@ class KagglerTUI(App[None]):
         if not value or not self._session:
             return
         event.input.value = ""
+        # slash 指令走确定性同步分支：不 disable 输入、不预挂助手 widget、不起 worker。
+        if value.startswith("/"):
+            self._handle_slash_command(value)
+            return
         event.input.disabled = True
         self._streaming_buf = ""
         self._streaming_dirty = False
@@ -201,6 +210,34 @@ class KagglerTUI(App[None]):
         self.run_worker(
             lambda: self._stream_worker(value), thread=True, name="stream"
         )
+
+    # ── Slash 指令（确定性、同步、不经 LLM）────────────────────────────────
+    def _system_msg(self, msg: str) -> None:
+        self._append(Text.assemble(("系统: ", "bold yellow"), (msg, "")))
+
+    def _handle_slash_command(self, raw: str) -> None:
+        # 回显指令入对话历史，与普通消息一致。
+        self._append(Text.assemble(("你: ", "bold blue"), (raw, "")))
+        name, args = parse(raw)
+        if name == "switch":
+            self._cmd_switch(args)
+        else:
+            avail = "、".join(f"/{c}" for c in COMMANDS)
+            self._system_msg(f"未知指令 /{name}，可用：{avail}")
+
+    def _cmd_switch(self, args: list[str]) -> None:
+        valid = " / ".join(m.value for m in Mode)
+        if not args:
+            self._system_msg(f"用法：/switch <mode>，可用模式：{valid}")
+            return
+        try:
+            mode = Mode(args[0])
+        except ValueError:
+            self._system_msg(f"未知模式：{args[0]}，可用模式：{valid}")
+            return
+        self._session.set_mode(mode)
+        self._update_status_bar(mode.value)
+        self._system_msg(f"已切换到 {_MODE_LABELS.get(mode.value, mode.value)}")
 
     # ── 流式回答（原地更新当前消息）──────────────────────────────────────
     def _flush_streaming(self) -> None:

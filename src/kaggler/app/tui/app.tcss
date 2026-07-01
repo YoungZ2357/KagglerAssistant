@@ -52,6 +52,14 @@ RichLog#agent-trace {
     padding: 0 1;
 }
 
+/* 指令提示行：仅在输入 slash 指令时出现（内容为空则 height:auto 收起，不占行） */
+#cmd-hint {
+    height: auto;
+    color: $text-muted;
+    text-style: italic;
+    padding: 0 1;
+}
+
 Input#user-input {
     height: auto;
 }

@@ -28,12 +28,16 @@ class CommandSpec:
     arg_candidates: tuple[str, ...] = ()
 
 
-# 指令注册表。首发仅 /switch；候选模式由 Mode 枚举动态生成。
+# 指令注册表。/switch 的候选模式由 Mode 枚举动态生成。
 COMMANDS: dict[str, CommandSpec] = {
     "switch": CommandSpec(
         name="switch",
         description="切换工作模式",
         arg_candidates=tuple(m.value for m in Mode),
+    ),
+    "exit": CommandSpec(
+        name="exit",
+        description="退出程序",
     ),
 }
 
@@ -47,6 +51,33 @@ def parse(raw: str) -> tuple[str, list[str]]:
     if not parts:
         return "", []
     return parts[0], parts[1:]
+
+
+def hint(value: str) -> str:
+    """据当前输入生成「所有可用候选」的提示文本，供输入框上方的提示行显示。
+
+    与 ``SlashSuggester`` 互补：Suggester 只在输入框内联补全**首个**匹配（灰色幽灵
+    文本），而本函数列出**全部**匹配项——命令名阶段列所有指令，参数阶段列所有候选
+    参数（如所有可用模式）。非 slash 输入返回空串（提示行随之收起）。
+    """
+    if not value.startswith("/"):
+        return ""
+    body = value[1:]
+    # 已到参数段（含空格）→ 列出该指令的全部候选参数。
+    if " " in body:
+        name, _, partial_arg = body.partition(" ")
+        spec = COMMANDS.get(name)
+        if spec is None or not spec.arg_candidates:
+            return ""
+        cands = [c for c in spec.arg_candidates if c.startswith(partial_arg)]
+        if not cands:
+            return ""
+        return "可选参数： " + "  ·  ".join(cands)
+    # 命令名段 → 列出所有前缀匹配的指令及其说明。
+    cmds = [c for c in COMMANDS.values() if c.name.startswith(body)]
+    if not cmds:
+        return ""
+    return "可用指令： " + "  ·  ".join(f"/{c.name} {c.description}" for c in cmds)
 
 
 class SlashSuggester(Suggester):

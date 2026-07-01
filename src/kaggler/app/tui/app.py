@@ -33,7 +33,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Header, Input, Label, RichLog, Static
 
-from kaggler.app.tui.commands import COMMANDS, SlashSuggester, parse
+from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
 from kaggler.app.tui.screens import FilePickerScreen
 from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
@@ -103,6 +103,8 @@ class KagglerTUI(App[None]):
                 yield RichLog(id="agent-trace", markup=False, highlight=False, wrap=True)
         with Vertical(id="bottom-bar"):
             yield Static("", id="status-bar")
+            # 指令提示行：输入 slash 指令时列出全部候选（命令 / 参数），否则收起。
+            yield Static("", id="cmd-hint", markup=False)
             yield Input(
                 placeholder="> ", id="user-input", disabled=True,
                 suggester=SlashSuggester(),
@@ -211,6 +213,10 @@ class KagglerTUI(App[None]):
             lambda: self._stream_worker(value), thread=True, name="stream"
         )
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # 随输入实时刷新指令提示行：列出全部可用候选（命令 / 参数）。
+        self.query_one("#cmd-hint", Static).update(hint(event.value))
+
     # ── Slash 指令（确定性、同步、不经 LLM）────────────────────────────────
     def _system_msg(self, msg: str) -> None:
         self._append(Text.assemble(("系统: ", "bold yellow"), (msg, "")))
@@ -221,6 +227,8 @@ class KagglerTUI(App[None]):
         name, args = parse(raw)
         if name == "switch":
             self._cmd_switch(args)
+        elif name == "exit":
+            self.exit()
         else:
             avail = "、".join(f"/{c}" for c in COMMANDS)
             self._system_msg(f"未知指令 /{name}，可用：{avail}")

@@ -8,6 +8,7 @@ from typing import Literal
 
 from langchain_core.messages import AIMessage
 
+from kaggler.graph.nodes import summary_cutoff
 from kaggler.graph.state import CommonState
 from kaggler.graph.types import Node
 from kaggler.shared.config import GraphConfig
@@ -18,14 +19,23 @@ def entry_condition(
         *,
         graph_config: GraphConfig,
 ) -> Literal[Node.SUMMARIZE, Node.REACT]:
-    """turn 入口路由：历史消息数达到阈值则先压缩对话，否则直接进入 react。
+    """turn 入口路由：历史消息数达到阈值且本次总结确有可删消息时先压缩，否则直接 react。
 
     ``graph_config`` 经 assembly 用 partial 绑定（仅关键字，避开 LangGraph
     保留名 ``config``）。返回 Node 成员而非裸字符串，使路由目标可被静态追溯。
+
+    达阈值但 ``summary_cutoff`` 为 0（如单个进行中的巨型回合，无法在不割裂回合的
+    前提下压缩）时跳过总结、直接 react，避免空转出一次无效的摘要 LLM 调用。
     """
-    if len(state["messages"]) >= graph_config.summary_trigger_count:
-        return Node.SUMMARIZE
-    return Node.REACT
+    messages = state["messages"]
+    if len(messages) < graph_config.summary_trigger_count:
+        return Node.REACT
+    cutoff = summary_cutoff(
+        messages,
+        keep=graph_config.summary_keep_recent,
+        trigger=graph_config.summary_trigger_count,
+    )
+    return Node.SUMMARIZE if cutoff > 0 else Node.REACT
 
 
 def route_after_agent(state: CommonState) -> Literal[Node.TOOLS, Node.FINISH]:

@@ -9,9 +9,9 @@ from typing import Callable
 
 from langchain_core.tools import BaseTool
 
-from kaggler.modes import eda
+from kaggler.modes import eda, feature_engineering
 from kaggler.shared.types import Mode
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 
@@ -33,14 +33,21 @@ tools_by_mode = {
 }
 
 prompt_templates: dict[Mode, str] = {
-    mode: spec.prompt_templates
+    mode: spec.prompt
     for mode, spec in REGISTRY.items()
 }
 
 """
 
 REGISTRY: dict[Mode, ModeSpec] = {
-    Mode.EDA: ModeSpec(tool_factory=eda.make_tools, prompt=eda.EDA_SYSTEM_PROMPT_TEMPLATE)
+    Mode.EDA: ModeSpec(
+        tool_factory=eda.make_tools,
+        prompt=eda.EDA_SYSTEM_PROMPT_TEMPLATE
+    ),
+    Mode.FEAT_ENG: ModeSpec(
+        tool_factory=feature_engineering.make_tools,
+        prompt=feature_engineering.FEAT_ENG_SYSTEM_PROMPT_TEMPLATE
+    )
 }
 
 

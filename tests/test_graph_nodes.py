@@ -1,7 +1,12 @@
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.tools import tool
 
-from kaggler.graph.nodes import finish_turn, react_node, summarize_conversation
+from kaggler.graph.nodes import (
+    finish_turn,
+    react_node,
+    summarize_conversation,
+    summary_cutoff,
+)
 from kaggler.shared.config import GraphConfig
 from kaggler.shared.types import Mode
 
@@ -53,7 +58,8 @@ class TestReactNode:
         )
         system = fake_llm.invoked_with[0]
         assert isinstance(system, SystemMessage)
-        assert system.content == "前缀 SCHEMA_X 后缀"
+        # 模板填充后作为前缀；工具声明块追加在其后
+        assert system.content.startswith("前缀 SCHEMA_X 后缀")
 
     def test_missing_schema_defaults_empty(self, fake_llm):
         react_node(
@@ -63,7 +69,45 @@ class TestReactNode:
             prompt_templates={Mode.EDA: "[{schema}]"},
             common_tools=[],
         )
-        assert fake_llm.invoked_with[0].content == "[]"
+        assert fake_llm.invoked_with[0].content.startswith("[]")
+
+    def test_summary_injected_when_present(self, fake_llm):
+        # (a) state 里有 summary → 回注进系统提示词
+        react_node(
+            self._state(summary="历史要点摘要"),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "{schema}"},
+            common_tools=[],
+        )
+        content = fake_llm.invoked_with[0].content
+        assert "对话历史摘要" in content
+        assert "历史要点摘要" in content
+
+    def test_no_summary_block_when_absent(self, fake_llm):
+        # 无 summary → 不出现摘要块
+        react_node(
+            self._state(),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "{schema}"},
+            common_tools=[],
+        )
+        assert "对话历史摘要" not in fake_llm.invoked_with[0].content
+
+    def test_available_tools_declared_in_prompt(self, fake_llm):
+        # (b) 当前可调用工具（common + 当前模式）显式写入提示词
+        react_node(
+            self._state(),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "{schema}"},
+            common_tools=[_common_tool],
+        )
+        content = fake_llm.invoked_with[0].content
+        assert "当前可调用工具" in content
+        assert "_eda_tool" in content
+        assert "_common_tool" in content
 
     def test_system_prepended_history_preserved(self, fake_llm):
         state = self._state()
@@ -99,6 +143,43 @@ class TestReactNode:
             common_tools=None,
         )
         assert {t.name for t in fake_llm.bound_tools} == {"_eda_tool"}
+
+
+class TestSummaryCutoff:
+    def _convo(self, turns: int, per_turn: int):
+        """构造 turns 个回合，每回合 1 条 Human + (per_turn-1) 条 AI，模拟工具密集程度。"""
+        msgs = []
+        for t in range(turns):
+            msgs.append(HumanMessage(content=f"h{t}", id=f"h{t}"))
+            for j in range(per_turn - 1):
+                msgs.append(AIMessage(content=f"a{t}_{j}", id=f"a{t}_{j}"))
+        return msgs
+
+    def test_caps_retained_below_trigger_on_dense_turns(self):
+        # #1：工具密集回合下，保留 keep=4 回合会超阈值 → 消息数上限进一步收紧
+        msgs = self._convo(turns=6, per_turn=8)  # 48 条
+        cut = summary_cutoff(msgs, keep=4, trigger=20)
+        retained = msgs[cut:]
+        assert len(retained) < 20  # 总结后必然低于阈值，不会下一轮立刻再触发
+        assert isinstance(retained[0], HumanMessage)  # 截断落在 Human 边界
+
+    def test_turn_budget_applies_when_light(self):
+        # 轻量回合（未达阈值）：回合预算生效，保留最近 keep 个 Human 起
+        msgs = self._convo(turns=6, per_turn=3)  # 18 条 < trigger
+        cut = summary_cutoff(msgs, keep=4, trigger=20)
+        humans = [m for m in msgs[cut:] if isinstance(m, HumanMessage)]
+        assert len(humans) == 4
+
+    def test_single_mega_turn_returns_zero(self):
+        # #2 支撑：仅 1 个 Human 的巨型回合，无法在不割裂回合下压缩 → 0
+        msgs = [HumanMessage(content="h", id="h")] + [
+            AIMessage(content=f"a{i}", id=f"a{i}") for i in range(30)
+        ]
+        assert summary_cutoff(msgs, keep=4, trigger=20) == 0
+
+    def test_no_deletion_within_keep(self):
+        msgs = self._convo(turns=2, per_turn=2)  # 2 个 Human <= keep
+        assert summary_cutoff(msgs, keep=4, trigger=20) == 0
 
 
 class TestSummarizeConversation:

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from kaggler.modes.eda.tools import make_tools
-from kaggler.workspace.data_provider import DataProvider
+from kaggler.persistence.data_provider import DataProvider
 
 
 @pytest.fixture

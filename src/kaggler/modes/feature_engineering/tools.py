@@ -48,7 +48,13 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         df = data.get(state["data_version"])
         result = exec_empty(df, [p.model_dump(mode="json") for p in pairs])
-        return commit_mutation(data, result, tool_call_id)
+        description = "空值处理: " + "; ".join(f"{p.column}→{p.action.value}" for p in pairs)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="execute_empty_value",
+            description=description,
+        )
 
     @tool
     def encode_columns(
@@ -70,7 +76,13 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         df = data.get(state["data_version"])
         result = exec_encode(df, [p.model_dump(mode="json") for p in pairs])
-        return commit_mutation(data, result, tool_call_id)
+        description = "编码: " + "; ".join(f"{p.column}→{p.action.value}" for p in pairs)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="encode_columns",
+            description=description,
+        )
 
     @tool
     def standardize_columns(
@@ -90,7 +102,12 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         df = data.get(state["data_version"])
         result = exec_standardize(df, columns)
-        return commit_mutation(data, result, tool_call_id)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="standardize_columns",
+            description=f"标准化列: {columns}",
+        )
 
     @tool
     def drop_columns(
@@ -109,7 +126,12 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         df = data.get(state["data_version"])
         result = exec_drop_columns(df, columns)
-        return commit_mutation(data, result, tool_call_id)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="drop_columns",
+            description=f"删除列: {columns}",
+        )
 
     @tool
     def filter_rows(
@@ -146,7 +168,14 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             group_logic=group_logic,
             action=action,
         )
-        return commit_mutation(data, result, tool_call_id)
+        action_value = getattr(action, "value", action)
+        group_logic_value = getattr(group_logic, "value", group_logic)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="filter_rows",
+            description=f"按条件筛选行 (action={action_value}, group_logic={group_logic_value})",
+        )
 
     @tool
     def execute_dim_reduct(
@@ -193,7 +222,16 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             target=target,
             standardize=standardize,
         )
-        return commit_mutation(data, result, tool_call_id)
+        method_value = getattr(method, "value", method)
+        description = f"降维 method={method_value} n_components={n_components}"
+        if target:
+            description += f" target={target}"
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="execute_dim_reduct",
+            description=description,
+        )
 
     return [
         execute_empty_value,

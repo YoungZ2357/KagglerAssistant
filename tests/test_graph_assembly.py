@@ -49,3 +49,9 @@ class TestBuildGraph:
         # 自定义配置不应导致组装失败
         graph = build_graph(loaded_data, graph_config=GraphConfig(summary_trigger_count=99))
         assert graph is not None
+
+    def test_common_tools_include_data_version_tools(self, loaded_data):
+        graph = build_graph(loaded_data)
+        tool_node = graph.get_graph().nodes[Node.TOOLS.value].data
+        names = set(tool_node.tools_by_name.keys())
+        assert {"switch_mode", "switch_data_version", "list_data_versions"} <= names

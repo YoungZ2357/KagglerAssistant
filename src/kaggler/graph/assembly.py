@@ -45,7 +45,7 @@ def build_graph(
     prompt_templates: dict[Mode, str] = {
         mode: spec.prompt for mode, spec in REGISTRY.items()
     }
-    common_tools = make_common_tools()
+    common_tools = make_common_tools(data)
 
     # 两档模型：react 用 PRO 主模型；压缩用更便宜的 FLASH，且不绑工具
     agent_llm = make_llm_raw(DeepSeekModel.PRO)

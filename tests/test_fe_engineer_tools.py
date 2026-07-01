@@ -72,6 +72,10 @@ class TestMakeFeatEngTools:
         assert msg["rows_after"] == 5
         assert len(msg["preview"]) == 3
         assert "columns" in msg["summary"][0]
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "standardize_columns"
+        assert "x" in info.description and "y" in info.description
 
     def test_standardize_columns_error(self, data):
         tool = _by_name(make_tools(data))["standardize_columns"]
@@ -96,6 +100,10 @@ class TestMakeFeatEngTools:
         msg = json.loads(update["messages"][0].content)
         assert msg["rows_before"] == 5
         assert msg["rows_after"] == 5
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "drop_columns"
+        assert "cat" in info.description
 
     def test_drop_columns_error(self, data):
         tool = _by_name(make_tools(data))["drop_columns"]
@@ -122,6 +130,10 @@ class TestMakeFeatEngTools:
         msg = json.loads(update["messages"][0].content)
         assert msg["rows_before"] == 5
         assert msg["rows_after"] == 3
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "filter_rows"
+        assert "keep" in info.description
 
     def test_filter_rows_delete_success(self, data):
         tool = _by_name(make_tools(data))["filter_rows"]
@@ -136,6 +148,10 @@ class TestMakeFeatEngTools:
         assert update["data_version"] == 1
         msg = json.loads(update["messages"][0].content)
         assert msg["rows_after"] == 2
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "filter_rows"
+        assert "delete" in info.description
 
     def test_filter_rows_error_does_not_bump_version(self, data):
         tool = _by_name(make_tools(data))["filter_rows"]
@@ -166,6 +182,10 @@ class TestMakeFeatEngTools:
         assert msg["rows_before"] == 5
         assert msg["rows_after"] == 5
         assert msg["summary"][0]["method"] == "pca"
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "execute_dim_reduct"
+        assert "pca" in info.description
 
     def test_dim_reduct_lda_success(self, data_multi):
         tool = _by_name(make_tools(data_multi))["execute_dim_reduct"]
@@ -180,6 +200,11 @@ class TestMakeFeatEngTools:
         assert update["data_version"] == 1
         msg = json.loads(update["messages"][0].content)
         assert msg["summary"][0]["method"] == "lda"
+        info = data_multi.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "execute_dim_reduct"
+        assert "lda" in info.description
+        assert "label" in info.description
 
     def test_dim_reduct_error(self, data):
         tool = _by_name(make_tools(data))["execute_dim_reduct"]
@@ -204,6 +229,10 @@ class TestMakeFeatEngTools:
         assert update["data_version"] == 1
         msg = json.loads(update["messages"][0].content)
         assert msg["rows_before"] == 5
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "execute_empty_value"
+        assert "x" in info.description
 
     # --- encode_columns success path ---
     def test_encode_columns_success(self, data):
@@ -217,3 +246,7 @@ class TestMakeFeatEngTools:
         assert update["data_version"] == 1
         msg = json.loads(update["messages"][0].content)
         assert msg["rows_before"] == 5
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "encode_columns"
+        assert "cat" in info.description

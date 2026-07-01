@@ -11,13 +11,22 @@ def dumps_cn(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-def commit_mutation(data: DataProvider, result: dict, tool_call_id: str) -> Command:
+def commit_mutation(
+    data: DataProvider,
+    result: dict,
+    tool_call_id: str,
+    *,
+    parent_version: int,
+    tool_name: str,
+    description: str,
+) -> Command:
     """写工具的统一收尾。
 
     compute 层约定：失败返回含 ``"error"`` 键的 dict；成功返回含
     ``processed_df`` 及 ``rows_before/rows_after/preview/summary`` 的 dict。
-    - 失败：原样回一条 ToolMessage，不改数据版本。
-    - 成功：登记新版本，回摘要并推进 ``data_version``。
+    - 失败：原样回一条 ToolMessage，不改数据版本，不记录谱系。
+    - 成功：登记新版本 + 谱系（parent_version/tool_name/description 由调用方
+      即各 FE 工具显式提供），回摘要并推进 ``data_version``。
     """
     if "error" in result:
         return Command(update={
@@ -26,7 +35,12 @@ def commit_mutation(data: DataProvider, result: dict, tool_call_id: str) -> Comm
             ],
         })
 
-    new_version = data.add_version(result["processed_df"])
+    new_version = data.add_version(
+        result["processed_df"],
+        parent=parent_version,
+        tool=tool_name,
+        description=description,
+    )
     payload = {k: result[k] for k in ("rows_before", "rows_after", "preview", "summary")}
     return Command(update={
         "data_version": new_version,

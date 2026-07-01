@@ -370,6 +370,48 @@ def exec_standardize(
     }
 
 
+def exec_drop_columns(
+    df: pl.DataFrame,
+    columns: list[str],
+) -> dict:
+    if not columns:
+        return {"error": "columns 不能为空"}
+
+    columns = list(dict.fromkeys(columns))
+
+    schema = df.schema
+    columns_set = set(schema.names())
+    unknown = [c for c in columns if c not in columns_set]
+    if unknown:
+        return {
+            "error": f"以下列名不存在：{unknown}",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+
+    result_df = df.drop(columns)
+
+    warnings = []
+    if result_df.width == 0:
+        warnings.append("已删除全部列，数据集为空")
+
+    preview_rows = result_df.head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+
+    summary = [{
+        "dropped_columns": columns,
+        "remaining_columns": result_df.columns,
+        "warnings": warnings,
+    }]
+
+    return {
+        "processed_df": result_df,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
+
+
 def exec_dim_reduct(
     df: pl.DataFrame,
     method: str,

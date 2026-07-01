@@ -4,6 +4,7 @@ import pytest
 
 from kaggler.modes.feature_engineering.compute import (
     exec_dim_reduct,
+    exec_drop_columns as execute_drop_columns,
     exec_empty as execute_empty_value,
     exec_encode as execute_encode,
     exec_standardize as execute_standardize,
@@ -398,6 +399,64 @@ class TestExecStandardize:
         result = execute_standardize(df, ["b", "a"])
         assert "error" in result
         assert "b" in result["error"]
+
+
+class TestExecDropColumns:
+    def test_success_basic(self):
+        df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]})
+        result = execute_drop_columns(df, ["b"])
+        assert "error" not in result
+        processed = result["processed_df"]
+        assert "b" not in processed.columns
+        assert processed.columns == ["a", "c"]
+        assert result["summary"][0]["remaining_columns"] == ["a", "c"]
+        assert result["rows_before"] == 3
+        assert result["rows_after"] == 3
+
+    def test_unknown_column(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_drop_columns(df, ["zzz"])
+        assert "error" in result
+        assert "列名不存在" in result["error"]
+
+    def test_empty_columns_list(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_drop_columns(df, [])
+        assert "error" in result
+
+    def test_duplicate_columns_in_list(self):
+        df = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
+        result = execute_drop_columns(df, ["a", "a"])
+        assert "error" not in result
+        assert result["processed_df"].columns == ["b"]
+        assert result["summary"][0]["dropped_columns"] == ["a"]
+
+    def test_drop_all_columns(self):
+        df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        result = execute_drop_columns(df, ["a", "b"])
+        assert "error" not in result
+        assert result["processed_df"].width == 0
+        assert result["rows_before"] == 3
+        assert result["rows_after"] == 0
+        assert "全部列" in str(result["summary"][0]["warnings"])
+
+    def test_preview_contains_three_rows(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]})
+        result = execute_drop_columns(df, ["b"])
+        assert len(result["preview"]) == 3
+
+    def test_preview_less_than_three_rows(self):
+        df = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
+        result = execute_drop_columns(df, ["b"])
+        assert len(result["preview"]) == 2
+
+    def test_summary_reports_remaining_columns(self):
+        df = pl.DataFrame({"a": [1], "b": [2], "c": [3]})
+        result = execute_drop_columns(df, ["a", "c"])
+        summary = result["summary"][0]
+        assert summary["dropped_columns"] == ["a", "c"]
+        assert summary["remaining_columns"] == ["b"]
+        assert summary["warnings"] == []
 
 
 class TestExecDimReduct:

@@ -40,13 +40,14 @@ def _by_name(tools):
 
 
 class TestMakeFeatEngTools:
-    def test_returns_four_named_tools(self, data):
+    def test_returns_five_named_tools(self, data):
         tools = make_tools(data)
         names = set(_by_name(tools))
         assert names == {
             "execute_empty_value",
             "encode_columns",
             "standardize_columns",
+            "drop_columns",
             "execute_dim_reduct",
         }
 
@@ -71,6 +72,30 @@ class TestMakeFeatEngTools:
         result_cmd = tool.func(
             state={"data_version": 0},
             tool_call_id="call_2",
+            columns=["z"],
+        )
+        msg = json.loads(result_cmd.update["messages"][0].content)
+        assert "error" in msg
+
+    # --- drop_columns ---
+    def test_drop_columns_success(self, data):
+        tool = _by_name(make_tools(data))["drop_columns"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_8",
+            columns=["cat"],
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_before"] == 5
+        assert msg["rows_after"] == 5
+
+    def test_drop_columns_error(self, data):
+        tool = _by_name(make_tools(data))["drop_columns"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_9",
             columns=["z"],
         )
         msg = json.loads(result_cmd.update["messages"][0].content)

@@ -6,6 +6,7 @@ from langgraph.types import Command
 
 from kaggler.modes.feature_engineering.compute import (
     exec_dim_reduct,
+    exec_drop_columns,
     exec_empty,
     exec_encode,
     exec_standardize,
@@ -88,6 +89,25 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         return commit_mutation(data, result, tool_call_id)
 
     @tool
+    def drop_columns(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        columns: list[str],
+    ) -> Command:
+        """删除指定的列。
+
+        columns 是一个列名字符串列表，将从数据集中直接移除这些列。
+
+        使用情景：
+        - 用户明确要求删除某些不需要的列（如 ID、冗余或已被其他特征替代的列）时
+        - 清理编码/降维前不需要的原始列
+        - 注意：删除全部列会得到空数据集；该操作不改变行数（除非删空所有列）
+        """
+        df = data.get(state["data_version"])
+        result = exec_drop_columns(df, columns)
+        return commit_mutation(data, result, tool_call_id)
+
+    @tool
     def execute_dim_reduct(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
@@ -138,5 +158,6 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         execute_empty_value,
         encode_columns,
         standardize_columns,
+        drop_columns,
         execute_dim_reduct,
     ]

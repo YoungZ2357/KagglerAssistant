@@ -9,12 +9,16 @@ from kaggler.modes.feature_engineering.compute import (
     exec_drop_columns,
     exec_empty,
     exec_encode,
+    exec_filter_rows,
     exec_standardize,
 )
 from kaggler.modes.feature_engineering.types import (
+    ConditionGroup,
     DimReductMethod,
     EncodePair,
     FillPair,
+    RowAction,
+    RowLogic,
 )
 from kaggler.persistence.data_provider import DataProvider
 from kaggler.shared.tool_helpers import commit_mutation
@@ -108,6 +112,43 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         return commit_mutation(data, result, tool_call_id)
 
     @tool
+    def filter_rows(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        groups: list[ConditionGroup],
+        group_logic: RowLogic,
+        action: RowAction,
+    ) -> Command:
+        """根据条件筛选行，保留或删除满足条件的行。
+
+        条件采用两层结构：
+        - 每个 ConditionGroup 内部用 logic（and/or）组合若干叶子条件（column, op, value）
+        - 多个 ConditionGroup 之间再用顶层 group_logic（and/or）组合
+        例如 (age > 60 且 income < 1000) 或 (flag == "invalid")，应拆分为两个 group：
+        [{"logic": "and", "conditions": [age>60, income<1000]}, {"logic": "and", "conditions": [flag=="invalid"]}]，
+        并将顶层 group_logic 设为 or。
+
+        action 决定整体语义：
+        - "keep"：只保留组合条件为真的行
+        - "delete"：删除组合条件为真的行，其余行（含条件涉及列为空值、无法判断真假的行）保留
+
+        注意：条件值的类型必须与对应列的数据类型匹配（数值列传数字，字符串列传字符串，布尔列传布尔值）。
+        注意：如果你缺乏必要信息，切换至eda模式并使用描述性数据分析
+        使用情景：
+        - 用户要求剔除异常值或明显错误的样本（如年龄为负数、某列超出合理范围）
+        - 用户要求只保留满足特定业务条件的子集数据
+        - 需要组合多个条件（且/或混合）来定位需要处理的行
+        """
+        df = data.get(state["data_version"])
+        result = exec_filter_rows(
+            df,
+            groups=[g.model_dump(mode="json") for g in groups],
+            group_logic=group_logic,
+            action=action,
+        )
+        return commit_mutation(data, result, tool_call_id)
+
+    @tool
     def execute_dim_reduct(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
@@ -159,5 +200,6 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         encode_columns,
         standardize_columns,
         drop_columns,
+        filter_rows,
         execute_dim_reduct,
     ]

@@ -4,7 +4,12 @@ import polars as pl
 import pytest
 
 from kaggler.modes.feature_engineering.tools import make_tools
-from kaggler.modes.feature_engineering.types import EncodePair, FillPair
+from kaggler.modes.feature_engineering.types import (
+    Condition,
+    ConditionGroup,
+    EncodePair,
+    FillPair,
+)
 from kaggler.persistence.data_provider import DataProvider
 
 
@@ -40,7 +45,7 @@ def _by_name(tools):
 
 
 class TestMakeFeatEngTools:
-    def test_returns_five_named_tools(self, data):
+    def test_returns_six_named_tools(self, data):
         tools = make_tools(data)
         names = set(_by_name(tools))
         assert names == {
@@ -48,6 +53,7 @@ class TestMakeFeatEngTools:
             "encode_columns",
             "standardize_columns",
             "drop_columns",
+            "filter_rows",
             "execute_dim_reduct",
         }
 
@@ -99,6 +105,50 @@ class TestMakeFeatEngTools:
             columns=["z"],
         )
         msg = json.loads(result_cmd.update["messages"][0].content)
+        assert "error" in msg
+
+    # --- filter_rows ---
+    def test_filter_rows_keep_success(self, data):
+        tool = _by_name(make_tools(data))["filter_rows"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_10",
+            groups=[ConditionGroup(logic="and", conditions=[Condition(column="x", op="gt", value=2.0)])],
+            group_logic="and",
+            action="keep",
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_before"] == 5
+        assert msg["rows_after"] == 3
+
+    def test_filter_rows_delete_success(self, data):
+        tool = _by_name(make_tools(data))["filter_rows"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_11",
+            groups=[ConditionGroup(logic="and", conditions=[Condition(column="x", op="gt", value=2.0)])],
+            group_logic="and",
+            action="delete",
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_after"] == 2
+
+    def test_filter_rows_error_does_not_bump_version(self, data):
+        tool = _by_name(make_tools(data))["filter_rows"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_12",
+            groups=[ConditionGroup(logic="and", conditions=[Condition(column="zzz", op="gt", value=2.0)])],
+            group_logic="and",
+            action="keep",
+        )
+        update = result_cmd.update
+        assert "data_version" not in update
+        msg = json.loads(update["messages"][0].content)
         assert "error" in msg
 
     # --- execute_dim_reduct ---

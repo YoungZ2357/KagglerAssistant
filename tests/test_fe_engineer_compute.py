@@ -7,6 +7,7 @@ from kaggler.modes.feature_engineering.compute import (
     exec_drop_columns as execute_drop_columns,
     exec_empty as execute_empty_value,
     exec_encode as execute_encode,
+    exec_filter_rows as execute_filter_rows,
     exec_standardize as execute_standardize,
     standardize_numeric,
     ONE_HOT_CARDINALITY_WARN,
@@ -457,6 +458,178 @@ class TestExecDropColumns:
         assert summary["dropped_columns"] == ["a", "c"]
         assert summary["remaining_columns"] == ["b"]
         assert summary["warnings"] == []
+
+
+def _cond(column, op, value):
+    return {"column": column, "op": op, "value": value}
+
+
+def _group(logic, conditions):
+    return {"logic": logic, "conditions": conditions}
+
+
+class TestExecFilterRows:
+    def test_keep_basic(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 2)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert "error" not in result
+        assert result["processed_df"]["a"].to_list() == [3, 4, 5]
+        assert result["rows_before"] == 5
+        assert result["rows_after"] == 3
+
+    def test_delete_basic(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 2)])],
+            group_logic="and",
+            action="delete",
+        )
+        assert "error" not in result
+        assert result["processed_df"]["a"].to_list() == [1, 2]
+        assert result["rows_after"] == 2
+
+    def test_group_inner_and(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 1), _cond("a", "lt", 5)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert result["processed_df"]["a"].to_list() == [2, 3, 4]
+
+    def test_group_inner_or(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("or", [_cond("a", "lt", 2), _cond("a", "gt", 4)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert result["processed_df"]["a"].to_list() == [1, 5]
+
+    def test_top_level_and_across_groups(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["x", "x", "y", "y", "y"]})
+        result = execute_filter_rows(
+            df,
+            groups=[
+                _group("and", [_cond("a", "gt", 1)]),
+                _group("and", [_cond("b", "eq", "y")]),
+            ],
+            group_logic="and",
+            action="keep",
+        )
+        assert result["processed_df"]["a"].to_list() == [3, 4, 5]
+
+    def test_top_level_or_across_groups(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["x", "x", "y", "y", "y"]})
+        result = execute_filter_rows(
+            df,
+            groups=[
+                _group("and", [_cond("a", "lt", 2)]),
+                _group("and", [_cond("b", "eq", "y")]),
+            ],
+            group_logic="or",
+            action="keep",
+        )
+        assert result["processed_df"]["a"].to_list() == [1, 3, 4, 5]
+
+    def test_unknown_column(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("zzz", "gt", 1)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert "error" in result
+        assert "列名不存在" in result["error"]
+
+    def test_multiple_dtype_errors_reported_together(self):
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", "notanumber"), _cond("b", "eq", 1)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert "error" in result
+        assert len(result["details"]) == 2
+
+    def test_bool_rejected_for_numeric_column(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", True)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert "error" in result
+
+    def test_empty_groups(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_filter_rows(df, groups=[], group_logic="and", action="keep")
+        assert "error" in result
+
+    def test_group_with_empty_conditions(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [])],
+            group_logic="and",
+            action="keep",
+        )
+        assert "error" in result
+
+    def test_null_handling_keep_excludes_null_row(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 0)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert result["processed_df"]["a"].to_list() == [1.0, 3.0]
+
+    def test_null_handling_delete_retains_null_row(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 2)])],
+            group_logic="and",
+            action="delete",
+        )
+        assert result["processed_df"]["a"].to_list() == [1.0, None]
+
+    def test_preview_contains_three_rows(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "ge", 1)])],
+            group_logic="and",
+            action="keep",
+        )
+        assert len(result["preview"]) == 3
+
+    def test_summary_content(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        result = execute_filter_rows(
+            df,
+            groups=[_group("and", [_cond("a", "gt", 1)])],
+            group_logic="and",
+            action="delete",
+        )
+        summary = result["summary"][0]
+        assert summary["action"] == "delete"
+        assert summary["rows_kept"] == result["rows_after"]
+        assert summary["rows_removed"] == result["rows_before"] - result["rows_after"]
+        assert "a > 1" in summary["condition_description"]
 
 
 class TestExecDimReduct:

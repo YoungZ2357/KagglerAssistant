@@ -6,9 +6,12 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from kaggler.shared.serialization import safe_val
 from kaggler.modes.feature_engineering.types import (
+    ComparisonOp,
     DimReductMethod,
     EncodeMethod,
     FillMethod,
+    RowAction,
+    RowLogic,
 )
 
 
@@ -401,6 +404,175 @@ def exec_drop_columns(
         "dropped_columns": columns,
         "remaining_columns": result_df.columns,
         "warnings": warnings,
+    }]
+
+    return {
+        "processed_df": result_df,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
+
+
+_OP_FUNCS = {
+    ComparisonOp.GT: lambda e, v: e > v,
+    ComparisonOp.LT: lambda e, v: e < v,
+    ComparisonOp.GE: lambda e, v: e >= v,
+    ComparisonOp.LE: lambda e, v: e <= v,
+    ComparisonOp.EQ: lambda e, v: e == v,
+    ComparisonOp.NE: lambda e, v: e != v,
+}
+
+_OP_SYMBOLS = {
+    ComparisonOp.GT: ">",
+    ComparisonOp.LT: "<",
+    ComparisonOp.GE: ">=",
+    ComparisonOp.LE: "<=",
+    ComparisonOp.EQ: "==",
+    ComparisonOp.NE: "!=",
+}
+
+_LOGIC_SYMBOLS = {
+    RowLogic.AND: "且",
+    RowLogic.OR: "或",
+}
+
+
+def _format_condition_value(value) -> str:
+    if isinstance(value, str):
+        return f'"{value}"'
+    return str(value)
+
+
+def exec_filter_rows(
+    df: pl.DataFrame,
+    groups: list[dict],
+    group_logic: str,
+    action: str,
+) -> dict:
+    try:
+        action_enum = RowAction(action)
+    except ValueError:
+        return {"error": f"未知的 action: {action}", "hint": "支持的值: keep, delete"}
+
+    try:
+        group_logic_enum = RowLogic(group_logic)
+    except ValueError:
+        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
+
+    if not groups:
+        return {"error": "groups 不能为空"}
+
+    empty_group_indices = [i for i, g in enumerate(groups) if not g.get("conditions")]
+    if empty_group_indices:
+        return {"error": f"以下分组下标的 conditions 不能为空：{empty_group_indices}"}
+
+    schema = df.schema
+    columns_set = set(schema.names())
+    all_conditions = [cond for g in groups for cond in g["conditions"]]
+
+    unknown = sorted({
+        cond["column"] for cond in all_conditions if cond["column"] not in columns_set
+    })
+    if unknown:
+        return {
+            "error": f"以下列名不存在：{unknown}",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+
+    errors = []
+    for i, g in enumerate(groups):
+        try:
+            RowLogic(g["logic"])
+        except ValueError:
+            errors.append({"group": i, "error": f"未知的 logic: {g['logic']}"})
+
+    for cond in all_conditions:
+        col = cond["column"]
+        value = cond["value"]
+        dtype = schema[col]
+
+        try:
+            ComparisonOp(cond["op"])
+        except ValueError:
+            errors.append({"column": col, "error": f"未知的比较运算符: {cond['op']}"})
+            continue
+
+        if dtype.is_numeric():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append({
+                    "column": col,
+                    "error": f"列 '{col}' 是数值类型（{dtype}），比较值必须是数字，当前值: {value!r}",
+                })
+        elif dtype == pl.String:
+            if not isinstance(value, str):
+                errors.append({
+                    "column": col,
+                    "error": f"列 '{col}' 是字符串类型，比较值必须是字符串，当前值: {value!r}",
+                })
+        elif dtype == pl.Boolean:
+            if not isinstance(value, bool):
+                errors.append({
+                    "column": col,
+                    "error": f"列 '{col}' 是布尔类型，比较值必须是布尔值，当前值: {value!r}",
+                })
+        else:
+            errors.append({
+                "column": col,
+                "error": f"列 '{col}' 的类型 {dtype} 暂不支持行筛选",
+            })
+
+    if errors:
+        return {"error": "部分条件不合法", "details": errors}
+
+    def leaf_expr(cond: dict) -> pl.Expr:
+        op = ComparisonOp(cond["op"])
+        return _OP_FUNCS[op](pl.col(cond["column"]), cond["value"])
+
+    def leaf_desc(cond: dict) -> str:
+        op = ComparisonOp(cond["op"])
+        return f"{cond['column']} {_OP_SYMBOLS[op]} {_format_condition_value(cond['value'])}"
+
+    group_exprs = []
+    group_descs = []
+    for g in groups:
+        logic = RowLogic(g["logic"])
+        conds = g["conditions"]
+
+        expr = leaf_expr(conds[0])
+        desc = leaf_desc(conds[0])
+        for cond in conds[1:]:
+            expr = (expr & leaf_expr(cond)) if logic == RowLogic.AND else (expr | leaf_expr(cond))
+            desc = f"{desc} {_LOGIC_SYMBOLS[logic]} {leaf_desc(cond)}"
+
+        group_exprs.append(expr)
+        group_descs.append(f"({desc})" if len(conds) > 1 else desc)
+
+    combined_expr = group_exprs[0]
+    combined_desc = group_descs[0]
+    for expr, desc in zip(group_exprs[1:], group_descs[1:]):
+        combined_expr = (
+            (combined_expr & expr) if group_logic_enum == RowLogic.AND else (combined_expr | expr)
+        )
+        combined_desc = f"{combined_desc} {_LOGIC_SYMBOLS[group_logic_enum]} {desc}"
+
+    combined_expr = combined_expr.fill_null(False)
+
+    if action_enum == RowAction.KEEP:
+        result_df = df.filter(combined_expr)
+    else:
+        result_df = df.filter(~combined_expr)
+
+    preview_rows = result_df.head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+
+    summary = [{
+        "action": action_enum.value,
+        "condition_description": combined_desc,
+        "group_logic": group_logic_enum.value,
+        "rows_kept": result_df.height,
+        "rows_removed": df.height - result_df.height,
     }]
 
     return {

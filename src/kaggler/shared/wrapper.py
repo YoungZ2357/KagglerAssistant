@@ -85,6 +85,9 @@ class AgentSession:
                                 {"name": tc["name"], "args": tc["args"]}
                                 for tc in msg.tool_calls
                             ]
+                    new_mode = (state_update or {}).get("current_mode")
+                    if new_mode is not None:
+                        yield {"type": "mode_change", "mode": str(new_mode)}
                     yield {
                         "type": "node_done",
                         "node": node_name,

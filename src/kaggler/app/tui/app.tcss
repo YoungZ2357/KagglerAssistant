@@ -40,8 +40,19 @@ RichLog#agent-trace {
     padding: 0 1;
 }
 
-Input#user-input {
+#bottom-bar {
     dock: bottom;
+    height: auto;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+Input#user-input {
     height: auto;
 }
 

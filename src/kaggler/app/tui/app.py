@@ -60,6 +60,11 @@ _SILENT_NODES: frozenset[str] = frozenset({"finish"})
 # trace 行的节点名列宽（对齐用）
 _LABEL_WIDTH: int = 10
 
+_MODE_LABELS: dict[str, str] = {
+    "eda": "EDA 探索分析",
+    "feature_engineering": "特征工程",
+}
+
 
 class StreamEvent(Message):
     """Worker 线程向 Textual 事件循环推送的通用事件载体。"""
@@ -94,7 +99,9 @@ class KagglerTUI(App[None]):
             with Vertical(id="trace-col"):
                 yield Label("Agent 行为", classes="panel-title")
                 yield RichLog(id="agent-trace", markup=False, highlight=False, wrap=True)
-        yield Input(placeholder="> ", id="user-input", disabled=True)
+        with Vertical(id="bottom-bar"):
+            yield Static("", id="status-bar")
+            yield Input(placeholder="> ", id="user-input", disabled=True)
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     def on_mount(self) -> None:
@@ -152,6 +159,7 @@ class KagglerTUI(App[None]):
             self._append(
                 Text.assemble(("助手: ", "bold green"), (random.choice(_GREETINGS), ""))
             )
+            self._update_status_bar("eda")
             self._enable_input()
 
         elif t == "token":
@@ -164,6 +172,9 @@ class KagglerTUI(App[None]):
 
         elif t == "node_done":
             self._handle_node_done(e["node"], e.get("tool_calls", []))
+
+        elif t == "mode_change":
+            self._update_status_bar(e["mode"])
 
         elif t == "turn_done":
             self._finalize_streaming()
@@ -216,6 +227,12 @@ class KagglerTUI(App[None]):
             self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
         self._streaming_buf = ""
         self._streaming_dirty = False
+
+    def _update_status_bar(self, mode: str) -> None:
+        label = _MODE_LABELS.get(mode, mode)
+        self.query_one("#status-bar", Static).update(
+            Text.assemble(("模式：", "dim"), (label, "bold cyan"))
+        )
 
     def _enable_input(self) -> None:
         inp = self.query_one("#user-input", Input)

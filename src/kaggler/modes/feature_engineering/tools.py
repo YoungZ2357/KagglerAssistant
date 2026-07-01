@@ -11,12 +11,16 @@ from kaggler.modes.feature_engineering.compute import (
     exec_encode,
     exec_filter_rows,
     exec_standardize,
+    exec_transform_combination,
+    exec_transform_mono,
 )
 from kaggler.modes.feature_engineering.types import (
+    CombineMethod,
     ConditionGroup,
     DimReductMethod,
     EncodePair,
     FillPair,
+    MonoSpec,
     RowAction,
     RowLogic,
 )
@@ -233,6 +237,90 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             description=description,
         )
 
+    @tool
+    def transform_column_mono(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        specs: list[MonoSpec],
+    ) -> Command:
+        """对单个数值列应用一元变换，产出新特征列附加到数据中（保留原列，不替换）。
+
+        专用于「只需一个原始特征」的新特征制作，例如线性模型的基函数变换和进阶特征工程。
+        specs 是变换规格的列表，每个规格对一列应用一种变换并生成一个新列。支持的 method：
+        - "cos"/"sin"/"tan"：三角函数
+        - "exp"：指数 e^x
+        - "log"：对数（默认自然对数；可用 base 指定底数）
+        - "sqrt"：平方根
+        - "square"：平方 x^2
+        - "power"：幂运算 x^exponent（用 exponent 指定指数）
+        - "linear"：线性变换 y = a*x + b（用 a 指定斜率、b 指定截距）
+        - "reciprocal"：倒数 1/x
+        - "abs"：绝对值
+
+        每个规格可用 output_name 指定新列名；省略时自动生成（如 cos_<列名>）。
+        注意：新列名不能与已有列或本批其它新列重名。变换若超出定义域（如对负数取对数、
+        对 0 取倒数）会产生 NaN/无穷值，工具会照常执行并在 summary 中给出警告。
+
+        使用情景：
+        - 为线性/多项式模型构造基函数特征（如取平方、对数、三角变换）
+        - 用户要求对某列做数学变换以改善其分布或线性关系时
+        - 一次可对多列分别应用不同变换
+        """
+        df = data.get(state["data_version"])
+        result = exec_transform_mono(
+            df, [s.model_dump(mode="json") for s in specs]
+        )
+        description = "一元变换: " + "; ".join(
+            f"{s.column}→{s.method.value}" for s in specs
+        )
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="transform_column_mono",
+            description=description,
+        )
+
+    @tool
+    def transform_column_combination(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        columns: list[str],
+        method: CombineMethod,
+        output_name: str,
+    ) -> Command:
+        """将多个数值列按算术方式组合为一个新特征列，附加到数据中（保留原列，不替换）。
+
+        专用于构造交叉特征（cross feature）。columns 是参与组合的列名列表（至少 2 列），
+        按传入顺序依次归约；output_name 为生成的新列名。支持的 method：
+        - "product"：各列相乘（即交叉特征，col1 * col2 * ...）
+        - "sum"：各列相加
+        - "mean"：各列求平均
+        - "difference"：依次相减（col1 - col2 - ...）
+        - "ratio"：依次相除（col1 / col2 / ...）
+
+        注意：所有列必须是数值类型；output_name 不能与已有列重名。ratio 遇到除零会产生
+        无穷值，工具会照常执行并在 summary 中给出警告。
+
+        使用情景：
+        - 用户希望用两个或多个特征的乘积/比值等构造交叉特征时
+        - 特征之间存在交互作用，需要显式建模（如 面积 = 长 * 宽、单价 = 总价 / 数量）
+        """
+        df = data.get(state["data_version"])
+        result = exec_transform_combination(
+            df,
+            columns=columns,
+            method=method,
+            output_name=output_name,
+        )
+        method_value = getattr(method, "value", method)
+        description = f"交叉特征: {columns} →({method_value}) {output_name}"
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="transform_column_combination",
+            description=description,
+        )
+
     return [
         execute_empty_value,
         encode_columns,
@@ -240,4 +328,6 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         drop_columns,
         filter_rows,
         execute_dim_reduct,
+        transform_column_mono,
+        transform_column_combination,
     ]

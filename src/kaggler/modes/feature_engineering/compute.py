@@ -1,3 +1,5 @@
+from functools import reduce
+
 import numpy as np
 import polars as pl
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -6,10 +8,12 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from kaggler.shared.serialization import safe_val
 from kaggler.modes.feature_engineering.types import (
+    CombineMethod,
     ComparisonOp,
     DimReductMethod,
     EncodeMethod,
     FillMethod,
+    MonoTransform,
     RowAction,
     RowLogic,
 )
@@ -782,4 +786,209 @@ def exec_dim_reduct(
     return {
         "error": f"未知的降维方法: {method}",
         "hint": "支持的方法: pca, lda",
+    }
+
+
+_MONO_EXPR = {
+    MonoTransform.COS: lambda c, s: c.cos(),
+    MonoTransform.SIN: lambda c, s: c.sin(),
+    MonoTransform.TAN: lambda c, s: c.tan(),
+    MonoTransform.EXP: lambda c, s: c.exp(),
+    MonoTransform.LOG: (
+        lambda c, s: c.log(s["base"]) if s.get("base") is not None else c.log()
+    ),
+    MonoTransform.SQRT: lambda c, s: c.sqrt(),
+    MonoTransform.SQUARE: lambda c, s: c.pow(2),
+    MonoTransform.POWER: lambda c, s: c.pow(s["exponent"]),
+    MonoTransform.LINEAR: lambda c, s: c * s["a"] + s["b"],
+    MonoTransform.RECIPROCAL: lambda c, s: 1.0 / c,
+    MonoTransform.ABS: lambda c, s: c.abs(),
+}
+
+_MONO_NAME_PREFIX = {
+    MonoTransform.COS: "cos",
+    MonoTransform.SIN: "sin",
+    MonoTransform.TAN: "tan",
+    MonoTransform.EXP: "exp",
+    MonoTransform.LOG: "log",
+    MonoTransform.SQRT: "sqrt",
+    MonoTransform.SQUARE: "square",
+    MonoTransform.POWER: "power",
+    MonoTransform.LINEAR: "linear",
+    MonoTransform.RECIPROCAL: "recip",
+    MonoTransform.ABS: "abs",
+}
+
+_COMBO_EXPR = {
+    CombineMethod.PRODUCT: lambda exprs: reduce(lambda a, b: a * b, exprs),
+    CombineMethod.SUM: lambda exprs: reduce(lambda a, b: a + b, exprs),
+    CombineMethod.MEAN: lambda exprs: reduce(lambda a, b: a + b, exprs) / len(exprs),
+    CombineMethod.DIFFERENCE: lambda exprs: reduce(lambda a, b: a - b, exprs),
+    CombineMethod.RATIO: lambda exprs: reduce(lambda a, b: a / b, exprs),
+}
+
+
+def _default_mono_name(spec: dict) -> str:
+    """为一元变换生成默认新列名，如 cos_x、linear_x、power2_x。"""
+    method = MonoTransform(spec["method"])
+    prefix = _MONO_NAME_PREFIX[method]
+    if method == MonoTransform.POWER:
+        exp = float(spec.get("exponent", 2.0))
+        exp_str = str(int(exp)) if exp.is_integer() else str(exp).replace(".", "_")
+        prefix = f"power{exp_str}"
+    return f"{prefix}_{spec['column']}"
+
+
+def _count_bad(series: pl.Series) -> tuple[int, int]:
+    """统计浮点列中 NaN 与 Inf 的数量；非浮点列返回 (0, 0)。"""
+    if series.dtype not in (pl.Float32, pl.Float64):
+        return 0, 0
+    nan_count = int(series.is_nan().fill_null(False).sum())
+    inf_count = int(series.is_infinite().fill_null(False).sum())
+    return nan_count, inf_count
+
+
+def exec_transform_mono(
+    df: pl.DataFrame,
+    specs: list[dict],
+) -> dict:
+    """对单个数值列应用一元变换，产出新列附加到数据中（保留原列）。"""
+    if not specs:
+        return {"error": "specs 不能为空"}
+
+    schema = df.schema
+    columns_set = set(schema.names())
+
+    unknown = [s["column"] for s in specs if s["column"] not in columns_set]
+    if unknown:
+        return {
+            "error": f"以下列名不存在：{unknown}",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+
+    non_numeric = [
+        s["column"] for s in specs if not schema[s["column"]].is_numeric()
+    ]
+    if non_numeric:
+        return {"error": f"以下列不是数值类型，无法进行一元变换：{non_numeric}"}
+
+    resolved = [s.get("output_name") or _default_mono_name(s) for s in specs]
+
+    collisions = []
+    seen_new: list[str] = []
+    for out in resolved:
+        if out in columns_set or out in seen_new:
+            collisions.append(out)
+        seen_new.append(out)
+    if collisions:
+        return {
+            "error": f"新列名与已有列或本批其它新列冲突：{collisions}",
+            "hint": "请为 output_name 指定不冲突的名称。",
+        }
+
+    result_df = df.clone()
+    summary = []
+    for spec, out in zip(specs, resolved):
+        method = MonoTransform(spec["method"])
+        expr = _MONO_EXPR[method](pl.col(spec["column"]), spec)
+        result_df = result_df.with_columns(expr.alias(out))
+
+        warnings = []
+        nan_count, inf_count = _count_bad(result_df[out])
+        if nan_count:
+            warnings.append(
+                f"变换后产生 {nan_count} 个 NaN（可能超出定义域，如对负数取对数或平方根）"
+            )
+        if inf_count:
+            warnings.append(
+                f"变换后产生 {inf_count} 个无穷值（可能存在除零，如对 0 取倒数）"
+            )
+
+        summary.append({
+            "source_column": spec["column"],
+            "method": method.value,
+            "output_column": out,
+            "warnings": warnings,
+        })
+
+    preview_rows = result_df.head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+
+    return {
+        "processed_df": result_df,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
+
+
+def exec_transform_combination(
+    df: pl.DataFrame,
+    columns: list[str],
+    method: str,
+    output_name: str,
+) -> dict:
+    """对多个数值列做算术组合（交叉特征），产出一个新列附加到数据中（保留原列）。"""
+    try:
+        method_enum = CombineMethod(method)
+    except ValueError:
+        return {
+            "error": f"未知的组合方法: {method}",
+            "hint": "支持的方法: product, sum, mean, difference, ratio",
+        }
+
+    if not output_name:
+        return {"error": "output_name 不能为空"}
+
+    columns = list(dict.fromkeys(columns))
+    if len(columns) < 2:
+        return {"error": f"组合特征至少需要 2 个不同的列，当前: {columns}"}
+
+    schema = df.schema
+    columns_set = set(schema.names())
+    unknown = [c for c in columns if c not in columns_set]
+    if unknown:
+        return {
+            "error": f"以下列名不存在：{unknown}",
+            "hint": "请先调用 explore_schema 确认列名。",
+        }
+
+    non_numeric = [c for c in columns if not schema[c].is_numeric()]
+    if non_numeric:
+        return {"error": f"以下列不是数值类型，无法进行组合：{non_numeric}"}
+
+    if output_name in columns_set:
+        return {
+            "error": f"新列名与已有列冲突：{output_name}",
+            "hint": "请为 output_name 指定不冲突的名称。",
+        }
+
+    exprs = [pl.col(c) for c in columns]
+    combined_expr = _COMBO_EXPR[method_enum](exprs)
+    result_df = df.with_columns(combined_expr.alias(output_name))
+
+    warnings = []
+    nan_count, inf_count = _count_bad(result_df[output_name])
+    if nan_count:
+        warnings.append(f"组合后产生 {nan_count} 个 NaN")
+    if inf_count:
+        warnings.append(f"组合后产生 {inf_count} 个无穷值（可能存在除零）")
+
+    summary = [{
+        "source_columns": columns,
+        "method": method_enum.value,
+        "output_column": output_name,
+        "warnings": warnings,
+    }]
+
+    preview_rows = result_df.head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+
+    return {
+        "processed_df": result_df,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
     }

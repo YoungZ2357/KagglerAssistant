@@ -9,6 +9,8 @@ from kaggler.modes.feature_engineering.compute import (
     exec_encode as execute_encode,
     exec_filter_rows as execute_filter_rows,
     exec_standardize as execute_standardize,
+    exec_transform_combination,
+    exec_transform_mono,
     standardize_numeric,
     ONE_HOT_CARDINALITY_WARN,
 )
@@ -878,3 +880,205 @@ class TestExecDimReduct:
         result = exec_dim_reduct(df, method="pca", n_components=-1)
         assert "error" in result
         assert "必须为正整数" in result["error"]
+
+
+def _mono(column, method, **kwargs):
+    spec = {"column": column, "method": method}
+    spec.update(kwargs)
+    return spec
+
+
+class TestExecTransformMono:
+    def test_cos_values_and_keeps_original(self):
+        df = pl.DataFrame({"x": [0.0, np.pi, 2 * np.pi]})
+        result = exec_transform_mono(df, [_mono("x", "cos")])
+        assert "error" not in result
+        processed = result["processed_df"]
+        assert processed.columns == ["x", "cos_x"]  # 原列保留 + 新列
+        assert processed["x"].to_list() == [0.0, np.pi, 2 * np.pi]
+        got = processed["cos_x"].to_list()
+        assert got == pytest.approx([1.0, -1.0, 1.0], abs=1e-9)
+
+    def test_exp_values(self):
+        df = pl.DataFrame({"x": [0.0, 1.0, 2.0]})
+        result = exec_transform_mono(df, [_mono("x", "exp")])
+        got = result["processed_df"]["exp_x"].to_list()
+        assert got == pytest.approx([1.0, np.e, np.e**2])
+
+    def test_sqrt_values(self):
+        df = pl.DataFrame({"x": [0.0, 4.0, 9.0]})
+        result = exec_transform_mono(df, [_mono("x", "sqrt")])
+        assert result["processed_df"]["sqrt_x"].to_list() == pytest.approx([0.0, 2.0, 3.0])
+
+    def test_linear_with_a_b(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        result = exec_transform_mono(df, [_mono("x", "linear", a=2.0, b=1.0)])
+        assert result["processed_df"]["linear_x"].to_list() == pytest.approx([3.0, 5.0, 7.0])
+
+    def test_power_with_exponent_and_name(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        result = exec_transform_mono(df, [_mono("x", "power", exponent=3.0)])
+        assert "power3_x" in result["processed_df"].columns
+        assert result["processed_df"]["power3_x"].to_list() == pytest.approx([1.0, 8.0, 27.0])
+
+    def test_custom_output_name(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        result = exec_transform_mono(df, [_mono("x", "square", output_name="x_sq")])
+        assert "x_sq" in result["processed_df"].columns
+        assert result["processed_df"]["x_sq"].to_list() == pytest.approx([1.0, 4.0, 9.0])
+
+    def test_multiple_specs_batch(self):
+        df = pl.DataFrame({"x": [1.0, 2.0], "y": [4.0, 9.0]})
+        result = exec_transform_mono(
+            df, [_mono("x", "square"), _mono("y", "sqrt")]
+        )
+        cols = result["processed_df"].columns
+        assert cols == ["x", "y", "square_x", "sqrt_y"]
+
+    def test_unknown_column(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        result = exec_transform_mono(df, [_mono("zzz", "cos")])
+        assert "error" in result
+        assert "列名不存在" in result["error"]
+
+    def test_non_numeric_column(self):
+        df = pl.DataFrame({"c": ["a", "b"]})
+        result = exec_transform_mono(df, [_mono("c", "cos")])
+        assert "error" in result
+        assert "不是数值类型" in result["error"]
+
+    def test_empty_specs(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        result = exec_transform_mono(df, [])
+        assert "error" in result
+
+    def test_output_name_collision_existing(self):
+        df = pl.DataFrame({"x": [1.0, 2.0], "y": [3.0, 4.0]})
+        result = exec_transform_mono(df, [_mono("x", "cos", output_name="y")])
+        assert "error" in result
+        assert "冲突" in result["error"]
+
+    def test_output_name_collision_within_batch(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        result = exec_transform_mono(
+            df,
+            [
+                _mono("x", "cos", output_name="dup"),
+                _mono("x", "sin", output_name="dup"),
+            ],
+        )
+        assert "error" in result
+        assert "冲突" in result["error"]
+
+    def test_domain_warning_log_negative(self):
+        df = pl.DataFrame({"x": [-1.0, 1.0, np.e]})
+        result = exec_transform_mono(df, [_mono("x", "log")])
+        assert "error" not in result
+        warnings = result["summary"][0]["warnings"]
+        assert any("NaN" in w for w in warnings)
+
+    def test_reciprocal_zero_warns_inf(self):
+        df = pl.DataFrame({"x": [0.0, 2.0, 4.0]})
+        result = exec_transform_mono(df, [_mono("x", "reciprocal")])
+        warnings = result["summary"][0]["warnings"]
+        assert any("无穷" in w for w in warnings)
+
+    def test_preview_three_rows(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        result = exec_transform_mono(df, [_mono("x", "abs")])
+        assert len(result["preview"]) == 3
+
+    def test_rows_unchanged(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        result = exec_transform_mono(df, [_mono("x", "cos")])
+        assert result["rows_before"] == 3
+        assert result["rows_after"] == 3
+
+
+class TestExecTransformCombination:
+    def test_product_is_cross_feature(self):
+        df = pl.DataFrame({"a": [2.0, 3.0], "b": [4.0, 5.0]})
+        result = exec_transform_combination(df, ["a", "b"], "product", "a_x_b")
+        assert "error" not in result
+        processed = result["processed_df"]
+        assert processed.columns == ["a", "b", "a_x_b"]  # 原列保留 + 新列
+        assert processed["a_x_b"].to_list() == pytest.approx([8.0, 15.0])
+
+    def test_sum(self):
+        df = pl.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+        result = exec_transform_combination(df, ["a", "b"], "sum", "s")
+        assert result["processed_df"]["s"].to_list() == pytest.approx([4.0, 6.0])
+
+    def test_mean(self):
+        df = pl.DataFrame({"a": [1.0, 3.0], "b": [3.0, 5.0]})
+        result = exec_transform_combination(df, ["a", "b"], "mean", "m")
+        assert result["processed_df"]["m"].to_list() == pytest.approx([2.0, 4.0])
+
+    def test_difference_sequential(self):
+        df = pl.DataFrame({"a": [10.0], "b": [3.0], "c": [2.0]})
+        result = exec_transform_combination(df, ["a", "b", "c"], "difference", "d")
+        assert result["processed_df"]["d"].to_list() == pytest.approx([5.0])
+
+    def test_ratio_sequential(self):
+        df = pl.DataFrame({"a": [12.0], "b": [3.0], "c": [2.0]})
+        result = exec_transform_combination(df, ["a", "b", "c"], "ratio", "r")
+        assert result["processed_df"]["r"].to_list() == pytest.approx([2.0])
+
+    def test_three_columns_product(self):
+        df = pl.DataFrame({"a": [2.0], "b": [3.0], "c": [4.0]})
+        result = exec_transform_combination(df, ["a", "b", "c"], "product", "p")
+        assert result["processed_df"]["p"].to_list() == pytest.approx([24.0])
+
+    def test_unknown_method(self):
+        df = pl.DataFrame({"a": [1.0], "b": [2.0]})
+        result = exec_transform_combination(df, ["a", "b"], "bogus", "x")
+        assert "error" in result
+        assert "未知的组合方法" in result["error"]
+
+    def test_unknown_column(self):
+        df = pl.DataFrame({"a": [1.0]})
+        result = exec_transform_combination(df, ["a", "zzz"], "sum", "x")
+        assert "error" in result
+        assert "列名不存在" in result["error"]
+
+    def test_non_numeric(self):
+        df = pl.DataFrame({"a": [1.0], "c": ["x"]})
+        result = exec_transform_combination(df, ["a", "c"], "sum", "x")
+        assert "error" in result
+        assert "不是数值类型" in result["error"]
+
+    def test_fewer_than_two_columns(self):
+        df = pl.DataFrame({"a": [1.0]})
+        result = exec_transform_combination(df, ["a"], "sum", "x")
+        assert "error" in result
+        assert "至少需要 2" in result["error"]
+
+    def test_dedup_makes_fewer_than_two(self):
+        df = pl.DataFrame({"a": [1.0], "b": [2.0]})
+        result = exec_transform_combination(df, ["a", "a"], "sum", "x")
+        assert "error" in result
+        assert "至少需要 2" in result["error"]
+
+    def test_output_name_collision(self):
+        df = pl.DataFrame({"a": [1.0], "b": [2.0]})
+        result = exec_transform_combination(df, ["a", "b"], "sum", "a")
+        assert "error" in result
+        assert "冲突" in result["error"]
+
+    def test_empty_output_name(self):
+        df = pl.DataFrame({"a": [1.0], "b": [2.0]})
+        result = exec_transform_combination(df, ["a", "b"], "sum", "")
+        assert "error" in result
+
+    def test_ratio_divide_by_zero_warns(self):
+        df = pl.DataFrame({"a": [1.0, 2.0], "b": [0.0, 4.0]})
+        result = exec_transform_combination(df, ["a", "b"], "ratio", "r")
+        warnings = result["summary"][0]["warnings"]
+        assert any("无穷" in w for w in warnings)
+
+    def test_preview_and_rows(self):
+        df = pl.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 1.0, 1.0, 1.0]})
+        result = exec_transform_combination(df, ["a", "b"], "sum", "s")
+        assert len(result["preview"]) == 3
+        assert result["rows_before"] == 4
+        assert result["rows_after"] == 4

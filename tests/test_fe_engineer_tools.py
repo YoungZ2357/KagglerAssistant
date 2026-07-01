@@ -9,6 +9,7 @@ from kaggler.modes.feature_engineering.types import (
     ConditionGroup,
     EncodePair,
     FillPair,
+    MonoSpec,
 )
 from kaggler.persistence.data_provider import DataProvider
 
@@ -45,7 +46,7 @@ def _by_name(tools):
 
 
 class TestMakeFeatEngTools:
-    def test_returns_six_named_tools(self, data):
+    def test_returns_eight_named_tools(self, data):
         tools = make_tools(data)
         names = set(_by_name(tools))
         assert names == {
@@ -55,6 +56,8 @@ class TestMakeFeatEngTools:
             "drop_columns",
             "filter_rows",
             "execute_dim_reduct",
+            "transform_column_mono",
+            "transform_column_combination",
         }
 
     # --- standardize_columns ---
@@ -250,3 +253,75 @@ class TestMakeFeatEngTools:
         assert info.parent == 0
         assert info.tool == "encode_columns"
         assert "cat" in info.description
+
+    # --- transform_column_mono ---
+    def test_transform_column_mono_success(self, data):
+        tool = _by_name(make_tools(data))["transform_column_mono"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_13",
+            specs=[MonoSpec(column="x", method="square")],
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_before"] == 5
+        assert msg["rows_after"] == 5
+        assert msg["summary"][0]["output_column"] == "square_x"
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "transform_column_mono"
+        assert "x" in info.description
+        # 新列已加入版本数据，原列保留
+        new_df = data.get(1)
+        assert "square_x" in new_df.columns
+        assert "x" in new_df.columns
+
+    def test_transform_column_mono_error(self, data):
+        tool = _by_name(make_tools(data))["transform_column_mono"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_14",
+            specs=[MonoSpec(column="zzz", method="cos")],
+        )
+        update = result_cmd.update
+        assert "data_version" not in update
+        msg = json.loads(update["messages"][0].content)
+        assert "error" in msg
+
+    # --- transform_column_combination ---
+    def test_transform_column_combination_success(self, data):
+        tool = _by_name(make_tools(data))["transform_column_combination"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_15",
+            columns=["x", "y"],
+            method="product",
+            output_name="x_times_y",
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_before"] == 5
+        assert msg["summary"][0]["output_column"] == "x_times_y"
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "transform_column_combination"
+        assert "x_times_y" in info.description
+        new_df = data.get(1)
+        assert "x_times_y" in new_df.columns
+        assert new_df["x_times_y"].to_list() == [10.0, 40.0, 90.0, 160.0, 250.0]
+
+    def test_transform_column_combination_error(self, data):
+        tool = _by_name(make_tools(data))["transform_column_combination"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_16",
+            columns=["x", "cat"],
+            method="product",
+            output_name="bad",
+        )
+        update = result_cmd.update
+        assert "data_version" not in update
+        msg = json.loads(update["messages"][0].content)
+        assert "error" in msg

@@ -7,16 +7,22 @@
 
 设计要点（沿用旧项目原型的核心经验）：
 - **单一对话窗**：对话历史与进行中的回答都活在左栏同一个可滚动容器
-  （``VerticalScroll#chat-log``）里。每条消息是一个 ``Static``；本轮回答的
-  ``Static`` 在流式过程中**原地更新**，结束即定稿，无两段式搬运。
-- **Agent 行为追溯**：右栏 ``RichLog#agent-trace`` 以 append-only 方式逐行记录
-  节点流转（▶ 进入 / ✓ 完成）与 react 节点决策的 tool_calls。仅呈现「Agent 做了
-  什么」，不渲染 tool_result 数据表（那是另一类需求，不在追溯范围内）。
-- **绝不把动态文本插值进 Rich markup 字符串**：对话/trace 写入一律用 Rich
-  ``Text`` 对象，``Static``/``RichLog`` 设 ``markup=False``，因此 LLM 输出里出现
-  ``[`` 等字符也不会触发 MarkupError。
+  （``VerticalScroll#chat-log``）里。每条消息是一个可点击的 ``ChatMessage``；本轮
+  回答的 ``ChatMessage`` 在流式过程中**原地更新**，结束即定稿，无两段式搬运。
+- **Agent 行为追溯**：右栏 ``VerticalScroll#agent-trace`` 以 append-only 方式逐行
+  记录节点流转（▶ 进入 / ✓ 完成）与 react 节点决策的 tool_calls，每行是一个带
+  ``turn_id`` 的 ``TraceLine``（可按轮高亮）。仅呈现「Agent 做了什么」，不渲染
+  tool_result 数据表（那是另一类需求，不在追溯范围内）。
+- **点击联动**：每条消息与其所在轮次的追溯行共享 ``turn_id``；点击消息即高亮该轮
+  的追溯行（见 ``on_chat_message_clicked``），为未来行为回溯等能力铺垫。
+- **Markdown 与 markup 安全**：用户/LLM 消息本轮结束后用 ``rich.markdown.Markdown``
+  渲染（流式中先显示纯文本）；它与 Rich console markup（``[red]``）无关，故 LLM 输出
+  里的 ``[`` 不会触发 MarkupError。系统/错误消息保持纯 ``Text``。详见 widgets.py。
 - **流式 token 节流渲染**：worker 线程只往 buffer 累积 token 并标脏，由一个
   ``set_interval`` 定时器整体刷新进行中那条消息，避免每 token 全量重渲染卡死 UI。
+  定时器仅在本轮流式期间运行（提交时 resume、定稿时 pause），空闲不空转。
+- **跟底滚动**：两个滚动容器用 Textual 内建 ``anchor()`` 跟随底部——新内容自动
+  钉底，用户向上滚动即自动解锚（流式刷新不再拽人），滚回底部自动恢复跟随。
 
 用法：
     kaggler                       # 安装后
@@ -27,13 +33,19 @@ import random
 from pathlib import Path
 from typing import Any
 
+from rich import box
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Header, Input, Label, RichLog, Static
+from textual.timer import Timer
+from textual.widgets import Header, Input, Label, Static
 
+from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
 from kaggler.app.tui.screens import FilePickerScreen
+from kaggler.app.tui.widgets import ChatMessage, TraceLine, TraceTable
+from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
 
 _GREETINGS = ["请讲！", "快点把问题端上来罢", "冲刺！冲刺！冲！冲！"]
@@ -60,6 +72,11 @@ _SILENT_NODES: frozenset[str] = frozenset({"finish"})
 # trace 行的节点名列宽（对齐用）
 _LABEL_WIDTH: int = 10
 
+_MODE_LABELS: dict[str, str] = {
+    "eda": "EDA 探索分析",
+    "feature_engineering": "特征工程",
+}
+
 
 class StreamEvent(Message):
     """Worker 线程向 Textual 事件循环推送的通用事件载体。"""
@@ -82,44 +99,78 @@ class KagglerTUI(App[None]):
         self._streaming_buf: str = ""
         self._streaming_dirty: bool = False
         # 本轮回答对应的消息 widget；token 原地更新它，结束置空。
-        self._stream_widget: Static | None = None
+        self._stream_widget: ChatMessage | None = None
+        # 节流定时器：仅在流式期间运行（on_mount 创建为暂停态）。
+        self._flush_timer: Timer | None = None
+        # 轮次计数：每轮普通问答 +1，用于打通「消息 ↔ 该轮追溯行」。
+        self._turn_id: int = 0
+        # 当前 node_active 建的活动行，等它的 node_done 到来时原地收尾（▶→✓）。
+        self._active_trace: TraceLine | None = None
+        # 活动行对应的节点名，防止串行错配到别的节点的 node_done。
+        self._active_trace_node: str | None = None
 
     # ── 布局 ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         yield Header()
+        # 顶部通栏：当前数据集信息（名/类型/绝对路径），为未来工作区加载预留。
+        yield Static("", id="file-bar")
         with Horizontal(id="main"):
             # 左栏：单一对话窗
             yield VerticalScroll(id="chat-log")
             # 右栏：Agent 行为追溯
             with Vertical(id="trace-col"):
                 yield Label("Agent 行为", classes="panel-title")
-                yield RichLog(id="agent-trace", markup=False, highlight=False, wrap=True)
-        yield Input(placeholder="> ", id="user-input", disabled=True)
+                yield VerticalScroll(id="agent-trace")
+        with Vertical(id="bottom-bar"):
+            yield Static("", id="status-bar")
+            # 指令提示行：输入 slash 指令时列出全部候选（命令 / 参数），否则收起。
+            yield Static("", id="cmd-hint", markup=False)
+            yield Input(
+                placeholder="> ", id="user-input", disabled=True,
+                suggester=SlashSuggester(),
+            )
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     def on_mount(self) -> None:
-        # 节流定时器：进行中回答整体刷新，避免每 token 重渲染。
-        self.set_interval(_FLUSH_INTERVAL, self._flush_streaming)
+        # 节流定时器：进行中回答整体刷新，避免每 token 重渲染。暂停态创建，
+        # 提交问题时 resume、本轮定稿时 pause，空闲不空转。
+        self._flush_timer = self.set_interval(
+            _FLUSH_INTERVAL, self._flush_streaming, pause=True
+        )
+        # 锚定两个滚动容器：新内容自动跟随到底部；用户向上滚动即自动解锚、
+        # 滚回底部自动恢复（Textual 内建机制，替代逐次手动 scroll_end）。
+        self.query_one("#chat-log", VerticalScroll).anchor()
+        self.query_one("#agent-trace", VerticalScroll).anchor()
+        # 不再强制选文件：直接进界面，用 /load-file 按需加载。
+        self._update_file_bar(None)
+        self.query_one("#status-bar", Static).update(
+            Text("输入 /load-file 加载数据集后开始对话 · 拖选文本后 Ctrl+C 复制", "dim")
+        )
+        self._add_message(
+            "system", "尚未加载数据集，输入 /load-file 选择一个 CSV 数据集开始对话。"
+        )
+        self._enable_input()
+
+    def _cmd_load_file(self) -> None:
         self.push_screen(FilePickerScreen(), self._on_file_picked)
 
     def _on_file_picked(self, path: str | None) -> None:
         if not path:
-            # 取消选择 → 无可用数据集，直接退出。
-            self.exit()
+            # 取消选择 → 保持当前状态（不退出程序）。
             return
         if not Path(path).is_file():
             self.notify(f"文件不存在：{path}", severity="error")
-            self.push_screen(FilePickerScreen(), self._on_file_picked)
             return
-        self._append(
-            Text.assemble(("系统: ", "bold yellow"), (f"正在加载数据集 {path} …", ""))
-        )
+        self.query_one("#user-input", Input).disabled = True
+        self._add_message("system", f"正在加载数据集 {path} …")
         self.run_worker(lambda: self._init_worker(path), thread=True, name="init")
 
     # ── 对话窗写入 ─────────────────────────────────────────────────────────
-    def _append(self, text: Text) -> Static:
-        """向左栏对话窗追加一条消息，返回该 widget（供流式原地更新）。"""
-        widget = Static(text, markup=False)
+    def _add_message(
+        self, role: str, raw: str, *, turn_id: int | None = None, markdown: bool = False
+    ) -> ChatMessage:
+        """向左栏对话窗追加一条可点击消息，返回该 widget（供流式原地更新）。"""
+        widget = ChatMessage(role, raw, turn_id=turn_id, markdown=markdown)
         log = self.query_one("#chat-log", VerticalScroll)
         log.mount(widget)
         log.scroll_end(animate=False)
@@ -130,7 +181,7 @@ class KagglerTUI(App[None]):
         try:
             session = AgentSession(path)
             self._session = session
-            self.post_message(StreamEvent({"type": "init_done"}))
+            self.post_message(StreamEvent({"type": "init_done", "path": path}))
         except Exception as exc:  # noqa: BLE001 — 后台线程异常需回送到 UI 显示
             self.post_message(StreamEvent({"type": "error", "message": str(exc)}))
 
@@ -149,9 +200,11 @@ class KagglerTUI(App[None]):
         t = e["type"]
 
         if t == "init_done":
-            self._append(
-                Text.assemble(("助手: ", "bold green"), (random.choice(_GREETINGS), ""))
-            )
+            # 重建会话：清空左栏与右栏追溯、归零轮次（新数据集 = 新对话）。
+            self._clear_conversation()
+            self._update_file_bar(e.get("path"))
+            self._add_message("assistant", random.choice(_GREETINGS))
+            self._update_status_bar("eda")
             self._enable_input()
 
         elif t == "token":
@@ -165,94 +218,215 @@ class KagglerTUI(App[None]):
         elif t == "node_done":
             self._handle_node_done(e["node"], e.get("tool_calls", []))
 
+        elif t == "mode_change":
+            self._update_status_bar(e["mode"])
+
         elif t == "turn_done":
             self._finalize_streaming()
             self._enable_input()
 
         elif t == "error":
             self._finalize_streaming()
-            self._append(
-                Text.assemble(("错误: ", "bold red"), (e.get("message", "未知错误"), ""))
-            )
+            self._add_message("error", e.get("message", "未知错误"))
             self._enable_input()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
-        if not value or not self._session:
+        if not value:
             return
         event.input.value = ""
+        # slash 指令走确定性同步分支：不 disable 输入、不预挂助手 widget、不起 worker。
+        # 放在 session 守卫之前——/load-file 等指令在未加载数据集时也须可用。
+        if value.startswith("/"):
+            self._handle_slash_command(value)
+            return
+        if self._session is None:
+            self._system_msg("尚未加载数据集，请先用 /load-file 选择 CSV 数据集。")
+            return
         event.input.disabled = True
         self._streaming_buf = ""
         self._streaming_dirty = False
-        self._append(Text.assemble(("你: ", "bold blue"), (value, "")))
+        # 推进轮次：用户消息、本轮回答、本轮追溯行共享同一 turn_id，供点击联动。
+        self._turn_id += 1
+        self._add_message("user", value, turn_id=self._turn_id)
         # 为本轮回答预挂一个 widget，后续 token 原地更新它（同一窗、同一条消息）。
-        self._stream_widget = self._append(Text.assemble(("助手: ", "bold green"), ("", "")))
+        self._stream_widget = self._add_message(
+            "assistant", "", turn_id=self._turn_id
+        )
+        self._flush_timer.resume()
         self.run_worker(
             lambda: self._stream_worker(value), thread=True, name="stream"
         )
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # 随输入实时刷新指令提示行：列出全部可用候选（命令 / 参数）。
+        self.query_one("#cmd-hint", Static).update(hint(event.value))
+
+    def on_chat_message_clicked(self, event: ChatMessage.Clicked) -> None:
+        """演示联动：点击消息 → 高亮该条 + 右栏同轮的追溯行并滚动可见。"""
+        msg = event.source
+        # 清除上一次的高亮。
+        for m in self.query(ChatMessage):
+            m.remove_class("selected")
+        for tl in self.query(TraceLine):
+            tl.remove_class("linked")
+        msg.add_class("selected")
+        if msg.turn_id is None:
+            return
+        linked = [tl for tl in self.query(TraceLine) if tl.turn_id == msg.turn_id]
+        for tl in linked:
+            tl.add_class("linked")
+        if linked:
+            linked[0].scroll_visible()
+
+    # ── Slash 指令（确定性、同步、不经 LLM）────────────────────────────────
+    def _system_msg(self, msg: str) -> None:
+        self._add_message("system", msg)
+
+    def _handle_slash_command(self, raw: str) -> None:
+        # 回显指令入对话历史，与普通消息一致（指令不推进轮次、不渲染 markdown）。
+        self._add_message("user", raw)
+        name, args = parse(raw)
+        if name == "switch":
+            self._cmd_switch(args)
+        elif name == "load-file":
+            self._cmd_load_file()
+        elif name == "exit":
+            self.exit()
+        else:
+            avail = "、".join(f"/{c}" for c in COMMANDS)
+            self._system_msg(f"未知指令 /{name}，可用：{avail}")
+
+    def _cmd_switch(self, args: list[str]) -> None:
+        if self._session is None:
+            self._system_msg("尚未加载数据集，请先用 /load-file 加载后再切换模式。")
+            return
+        valid = " / ".join(m.value for m in Mode)
+        if not args:
+            self._system_msg(f"用法：/switch <mode>，可用模式：{valid}")
+            return
+        try:
+            mode = Mode(args[0])
+        except ValueError:
+            self._system_msg(f"未知模式：{args[0]}，可用模式：{valid}")
+            return
+        self._session.set_mode(mode)
+        self._update_status_bar(mode.value)
+        self._system_msg(f"已切换到 {_MODE_LABELS.get(mode.value, mode.value)}")
+
     # ── 流式回答（原地更新当前消息）──────────────────────────────────────
     def _flush_streaming(self) -> None:
-        """节流刷新：仅在有新 token 时整体重绘进行中那条消息。"""
+        """节流刷新：仅在有新 token 时整体重绘进行中那条消息（纯文本 + 光标）。"""
         if not self._streaming_dirty or self._stream_widget is None:
             return
         self._streaming_dirty = False
-        body = Text.assemble(("助手: ", "bold green"), (self._streaming_buf, ""))
-        body.append(" ▌", style="blink")
-        self._stream_widget.update(body)
-        self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
+        self._stream_widget.append_cursor(self._streaming_buf)
 
     def _finalize_streaming(self) -> None:
-        """本轮结束：去掉光标定稿当前消息；若无内容则移除占位 widget。"""
+        """本轮结束：去掉光标并渲染为 markdown 定稿；若无内容则移除占位 widget。"""
         widget = self._stream_widget
         self._stream_widget = None
         if widget is not None:
             if self._streaming_buf:
-                widget.update(
-                    Text.assemble(("助手: ", "bold green"), (self._streaming_buf, ""))
-                )
+                widget.set_content(self._streaming_buf, markdown=True)
             else:
                 widget.remove()
-            self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
         self._streaming_buf = ""
         self._streaming_dirty = False
+        # 本轮收尾：清空活动行引用，避免下一轮的 node_done 误改这条已定稿的行。
+        self._active_trace = None
+        self._active_trace_node = None
+        if self._flush_timer is not None:
+            self._flush_timer.pause()
+
+    def _update_status_bar(self, mode: str) -> None:
+        label = _MODE_LABELS.get(mode, mode)
+        self.query_one("#status-bar", Static).update(
+            Text.assemble(
+                ("模式：", "dim"), (label, "bold cyan"),
+                ("    点击消息可高亮该轮 Agent 行为 · 拖选文本后 Ctrl+C 复制", "dim"),
+            )
+        )
 
     def _enable_input(self) -> None:
         inp = self.query_one("#user-input", Input)
         inp.disabled = False
         inp.focus()
 
-    # ── Agent 行为追溯（右栏 append-only RichLog）────────────────────────────
+    def _clear_conversation(self) -> None:
+        """重建会话：清空左栏对话与右栏追溯，归零轮次与活动行引用。"""
+        self._turn_id = 0
+        self._active_trace = None
+        self._active_trace_node = None
+        self.query_one("#chat-log", VerticalScroll).remove_children()
+        self.query_one("#agent-trace", VerticalScroll).remove_children()
+
+    def _update_file_bar(self, path: str | None) -> None:
+        """刷新顶部文件信息栏：文件名 · 类型 · 绝对路径；未加载则给出提示。"""
+        bar = self.query_one("#file-bar", Static)
+        if not path:
+            bar.update(Text("未加载数据集 · 输入 /load-file 选择 CSV", "dim"))
+            return
+        p = Path(path).resolve()
+        ftype = p.suffix[1:].upper() if p.suffix else "文件"
+        bar.update(
+            Text.assemble(
+                ("📄 ", ""), (p.name, "bold cyan"),
+                ("  ·  ", "dim"), (ftype, "green"),
+                ("  ·  ", "dim"), (str(p), "dim"),
+            )
+        )
+
+    # ── Agent 行为追溯（每个节点访问一条，原地 ▶→✓ 收尾）──────────────────────
     def _handle_node_active(self, node: str) -> None:
+        # node_active：建一条「▶ 生成中…」行并记为活动行，等 node_done 原地收尾。
         if node in _SILENT_NODES:
             return
         label = _NODE_LABELS.get(node, node)
-        self._write_trace("▶", "yellow", label, "生成中…")
+        tl = TraceLine(
+            self._trace_text("▶", "yellow", label, "生成中…"), turn_id=self._turn_id
+        )
+        # 先存引用再 mount：mount() 返回 AwaitMount 而非部件本身。
+        self._active_trace = tl
+        self._active_trace_node = node
+        self.query_one("#agent-trace", VerticalScroll).mount(tl)
 
     def _handle_node_done(self, node: str, tool_calls: list[dict]) -> None:
+        # node_done：把本节点的活动行原地改成「✓ 完成」；react 决策的工具批次内联成表。
         if node in _SILENT_NODES:
             return
         label = _NODE_LABELS.get(node, node)
-        # 一个 react 节点可能并行发起多个工具调用，逐个成行，避免只追溯到第一个。
-        if tool_calls:
-            for tc in tool_calls:
-                self._write_trace("✓", "green", label, self._fmt_tool_call(tc))
+        done = self._trace_text("✓", "green", label, _NODE_DESC.get(node, "完成"))
+        log = self.query_one("#agent-trace", VerticalScroll)
+        if self._active_trace is not None and self._active_trace_node == node:
+            self._active_trace.update(done)  # 原地收尾：▶→✓、黄→绿、生成中→完成
         else:
-            self._write_trace("✓", "green", label, _NODE_DESC.get(node, "完成"))
+            # 兜底：没有匹配的活动行（不该发生），退化为新挂一条完成行。
+            log.mount(TraceLine(done, turn_id=self._turn_id))
+        if tool_calls:
+            log.mount(
+                TraceTable(self._build_tool_table(tool_calls), turn_id=self._turn_id)
+            )
+        self._active_trace = None
+        self._active_trace_node = None
 
-    def _write_trace(self, icon: str, icon_color: str, label: str, desc: str) -> None:
-        line = Text.assemble(
+    def _trace_text(self, icon: str, icon_color: str, label: str, desc: str) -> Text:
+        return Text.assemble(
             (f"{icon} ", icon_color),
             (f"{str(label):<{_LABEL_WIDTH}}", "cyan"),
             (desc, ""),
         )
-        self.query_one("#agent-trace", RichLog).write(line)
 
-    def _fmt_tool_call(self, tc: dict) -> str:
-        name = tc.get("name", "")
-        args = tc.get("args", {})
-        arg_str = ", ".join(f"{k}='{v}'" for k, v in list(args.items())[:2])
-        return f"{name}({arg_str})" if arg_str else f"{name}()"
+    def _build_tool_table(self, tool_calls: list[dict]) -> Table:
+        # 窄栏（3fr）：轻量线框 + 撑满栏宽 + 长文换行不裁断。
+        table = Table(box=box.SIMPLE, expand=True, pad_edge=False, show_edge=True)
+        table.add_column("工具", style="cyan", overflow="fold")
+        table.add_column("参数", overflow="fold")
+        for tc in tool_calls:
+            args = tc.get("args", {})
+            arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "—"
+            table.add_row(tc.get("name", ""), arg_str)
+        return table
 
 
 def main() -> None:

@@ -4,6 +4,15 @@ Header {
     dock: top;
 }
 
+/* 顶部通栏：当前数据集信息（名/类型/绝对路径），与 Header 同 dock:top 叠在其下 */
+#file-bar {
+    dock: top;
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
 /* 主区：左栏对话 + 右栏 Agent 行为追溯 */
 #main {
     height: 1fr;
@@ -17,9 +26,28 @@ VerticalScroll#chat-log {
     border-right: tall $panel;
 }
 
-#chat-log > Static {
+/* 每条对话消息：可点击元素，selected 为点击选中态。
+   注意：不要给 ChatMessage 加 :hover 规则——hover 伪类切换会对整个消息子树做
+   全量 CSS 重算+重绘（定稿后正文是 Markdown 部件，后代数百个），滚轮滚动时
+   悬停部件不断变化，代价随消息体量增长，直接导致滚动卡顿。 */
+ChatMessage {
     height: auto;
     margin-bottom: 1;
+    padding: 0 1;
+}
+
+ChatMessage.selected {
+    border-left: thick $accent;
+}
+
+/* 正文：收紧 Markdown 部件默认块间距、背景透明以配合 hover 高亮。 */
+ChatMessage .msg-body {
+    margin: 0;
+}
+
+ChatMessage Markdown {
+    margin: 0;
+    background: transparent;
 }
 
 /* 右栏：Agent 行为追溯 */
@@ -35,13 +63,48 @@ VerticalScroll#chat-log {
     text-style: bold;
 }
 
-RichLog#agent-trace {
+VerticalScroll#agent-trace {
     height: 1fr;
     padding: 0 1;
 }
 
-Input#user-input {
+/* 单行追溯：linked 为「与被点消息同轮」的联动高亮态。 */
+TraceLine {
+    height: auto;
+}
+
+TraceLine.linked {
+    background: $accent-darken-2;
+}
+
+/* react 决策的一批 tool_calls 内联表格（工具名 | 参数）。
+   TraceLine.linked 经基类匹配对它同样生效，联动高亮无需额外规则。 */
+TraceTable {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#bottom-bar {
     dock: bottom;
+    height: auto;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* 指令提示行：仅在输入 slash 指令时出现（内容为空则 height:auto 收起，不占行） */
+#cmd-hint {
+    height: auto;
+    color: $text-muted;
+    text-style: italic;
+    padding: 0 1;
+}
+
+Input#user-input {
     height: auto;
 }
 
@@ -103,6 +166,10 @@ DirectoryBrowserScreen {
 
 #db-root {
     width: 1fr;
+}
+
+#db-up {
+    margin-left: 1;
 }
 
 #db-go {

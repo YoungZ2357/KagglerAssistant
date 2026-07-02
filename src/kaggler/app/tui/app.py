@@ -112,6 +112,8 @@ class KagglerTUI(App[None]):
     # ── 布局 ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         yield Header()
+        # 顶部通栏：当前数据集信息（名/类型/绝对路径），为未来工作区加载预留。
+        yield Static("", id="file-bar")
         with Horizontal(id="main"):
             # 左栏：单一对话窗
             yield VerticalScroll(id="chat-log")
@@ -139,17 +141,27 @@ class KagglerTUI(App[None]):
         # 滚回底部自动恢复（Textual 内建机制，替代逐次手动 scroll_end）。
         self.query_one("#chat-log", VerticalScroll).anchor()
         self.query_one("#agent-trace", VerticalScroll).anchor()
+        # 不再强制选文件：直接进界面，用 /load-file 按需加载。
+        self._update_file_bar(None)
+        self.query_one("#status-bar", Static).update(
+            Text("输入 /load-file 加载数据集后开始对话 · 拖选文本后 Ctrl+C 复制", "dim")
+        )
+        self._add_message(
+            "system", "尚未加载数据集，输入 /load-file 选择一个 CSV 数据集开始对话。"
+        )
+        self._enable_input()
+
+    def _cmd_load_file(self) -> None:
         self.push_screen(FilePickerScreen(), self._on_file_picked)
 
     def _on_file_picked(self, path: str | None) -> None:
         if not path:
-            # 取消选择 → 无可用数据集，直接退出。
-            self.exit()
+            # 取消选择 → 保持当前状态（不退出程序）。
             return
         if not Path(path).is_file():
             self.notify(f"文件不存在：{path}", severity="error")
-            self.push_screen(FilePickerScreen(), self._on_file_picked)
             return
+        self.query_one("#user-input", Input).disabled = True
         self._add_message("system", f"正在加载数据集 {path} …")
         self.run_worker(lambda: self._init_worker(path), thread=True, name="init")
 
@@ -169,7 +181,7 @@ class KagglerTUI(App[None]):
         try:
             session = AgentSession(path)
             self._session = session
-            self.post_message(StreamEvent({"type": "init_done"}))
+            self.post_message(StreamEvent({"type": "init_done", "path": path}))
         except Exception as exc:  # noqa: BLE001 — 后台线程异常需回送到 UI 显示
             self.post_message(StreamEvent({"type": "error", "message": str(exc)}))
 
@@ -188,6 +200,9 @@ class KagglerTUI(App[None]):
         t = e["type"]
 
         if t == "init_done":
+            # 重建会话：清空左栏与右栏追溯、归零轮次（新数据集 = 新对话）。
+            self._clear_conversation()
+            self._update_file_bar(e.get("path"))
             self._add_message("assistant", random.choice(_GREETINGS))
             self._update_status_bar("eda")
             self._enable_input()
@@ -217,12 +232,16 @@ class KagglerTUI(App[None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
-        if not value or not self._session:
+        if not value:
             return
         event.input.value = ""
         # slash 指令走确定性同步分支：不 disable 输入、不预挂助手 widget、不起 worker。
+        # 放在 session 守卫之前——/load-file 等指令在未加载数据集时也须可用。
         if value.startswith("/"):
             self._handle_slash_command(value)
+            return
+        if self._session is None:
+            self._system_msg("尚未加载数据集，请先用 /load-file 选择 CSV 数据集。")
             return
         event.input.disabled = True
         self._streaming_buf = ""
@@ -270,6 +289,8 @@ class KagglerTUI(App[None]):
         name, args = parse(raw)
         if name == "switch":
             self._cmd_switch(args)
+        elif name == "load-file":
+            self._cmd_load_file()
         elif name == "exit":
             self.exit()
         else:
@@ -277,6 +298,9 @@ class KagglerTUI(App[None]):
             self._system_msg(f"未知指令 /{name}，可用：{avail}")
 
     def _cmd_switch(self, args: list[str]) -> None:
+        if self._session is None:
+            self._system_msg("尚未加载数据集，请先用 /load-file 加载后再切换模式。")
+            return
         valid = " / ".join(m.value for m in Mode)
         if not args:
             self._system_msg(f"用法：/switch <mode>，可用模式：{valid}")
@@ -328,6 +352,30 @@ class KagglerTUI(App[None]):
         inp = self.query_one("#user-input", Input)
         inp.disabled = False
         inp.focus()
+
+    def _clear_conversation(self) -> None:
+        """重建会话：清空左栏对话与右栏追溯，归零轮次与活动行引用。"""
+        self._turn_id = 0
+        self._active_trace = None
+        self._active_trace_node = None
+        self.query_one("#chat-log", VerticalScroll).remove_children()
+        self.query_one("#agent-trace", VerticalScroll).remove_children()
+
+    def _update_file_bar(self, path: str | None) -> None:
+        """刷新顶部文件信息栏：文件名 · 类型 · 绝对路径；未加载则给出提示。"""
+        bar = self.query_one("#file-bar", Static)
+        if not path:
+            bar.update(Text("未加载数据集 · 输入 /load-file 选择 CSV", "dim"))
+            return
+        p = Path(path).resolve()
+        ftype = p.suffix[1:].upper() if p.suffix else "文件"
+        bar.update(
+            Text.assemble(
+                ("📄 ", ""), (p.name, "bold cyan"),
+                ("  ·  ", "dim"), (ftype, "green"),
+                ("  ·  ", "dim"), (str(p), "dim"),
+            )
+        )
 
     # ── Agent 行为追溯（每个节点访问一条，原地 ▶→✓ 收尾）──────────────────────
     def _handle_node_active(self, node: str) -> None:

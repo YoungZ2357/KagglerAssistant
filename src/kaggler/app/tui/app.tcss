@@ -4,6 +4,15 @@ Header {
     dock: top;
 }
 
+/* 顶部通栏：当前数据集信息（名/类型/绝对路径），与 Header 同 dock:top 叠在其下 */
+#file-bar {
+    dock: top;
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
 /* 主区：左栏对话 + 右栏 Agent 行为追溯 */
 #main {
     height: 1fr;
@@ -157,6 +166,10 @@ DirectoryBrowserScreen {
 
 #db-root {
     width: 1fr;
+}
+
+#db-up {
+    margin-left: 1;
 }
 
 #db-go {

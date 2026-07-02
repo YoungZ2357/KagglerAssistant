@@ -35,6 +35,10 @@ COMMANDS: dict[str, CommandSpec] = {
         description="切换工作模式",
         arg_candidates=tuple(m.value for m in Mode),
     ),
+    "load-file": CommandSpec(
+        name="load-file",
+        description="加载数据集文件",
+    ),
     "exit": CommandSpec(
         name="exit",
         description="退出程序",

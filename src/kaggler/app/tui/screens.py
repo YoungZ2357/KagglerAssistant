@@ -50,6 +50,7 @@ class DirectoryBrowserScreen(ModalScreen[str | None]):
             yield Label("浏览并选择 CSV（点选 .csv 即确认）", id="db-title")
             with Horizontal(id="db-rootbar"):
                 yield Input(value=str(self._root), id="db-root", placeholder="根目录")
+                yield Button("上一级", id="db-up")
                 yield Button("前往", id="db-go")
             yield _CsvDirectoryTree(str(self._root), id="db-tree")
             with Horizontal(id="db-buttons"):
@@ -67,6 +68,8 @@ class DirectoryBrowserScreen(ModalScreen[str | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "db-go":
             self._goto_root()
+        elif event.button.id == "db-up":
+            self._go_parent()
         else:  # db-cancel
             self.dismiss(None)
 
@@ -82,6 +85,19 @@ class DirectoryBrowserScreen(ModalScreen[str | None]):
             return
         tree = self.query_one("#db-tree", _CsvDirectoryTree)
         tree.path = str(new_root.resolve())  # 设置 reactive path 会自动 reload
+        tree.focus()
+
+    def _go_parent(self) -> None:
+        """跳到当前根目录的上一级；已在文件系统最顶层则提示。"""
+        tree = self.query_one("#db-tree", _CsvDirectoryTree)
+        current = Path(tree.path)
+        parent = current.parent
+        if parent == current:  # 到盘符/根，无更上层
+            self.notify("已在最顶层目录", severity="information")
+            return
+        parent = parent.resolve()
+        tree.path = str(parent)  # 设置 reactive path 会自动 reload
+        self.query_one("#db-root", Input).value = str(parent)  # 同步根目录输入框
         tree.focus()
 
     def action_cancel(self) -> None:

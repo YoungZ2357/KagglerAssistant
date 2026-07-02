@@ -110,3 +110,13 @@ class TraceLine(Static):
     ) -> None:
         super().__init__(renderable, markup=False, **kwargs)
         self.turn_id = turn_id
+
+
+class TraceTable(TraceLine):
+    """react 决策的一批 tool_calls，以表格渲染（工具名 | 参数）。
+
+    继承 :class:`TraceLine` 而非直接继承 ``Static``：既自动携带 ``turn_id``，又能被
+    ``on_chat_message_clicked`` 里的 ``query(TraceLine)`` 命中（Textual 类型选择器匹配
+    基类，故 ``TraceLine.linked`` 高亮规则也对它生效），点击联动无需改动。构造时传入一个
+    ``rich.table.Table`` 作为 renderable（``markup=False`` 已在基类设好）。
+    """

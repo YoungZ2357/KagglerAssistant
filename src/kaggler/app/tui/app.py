@@ -33,6 +33,8 @@ import random
 from pathlib import Path
 from typing import Any
 
+from rich import box
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -42,7 +44,7 @@ from textual.widgets import Header, Input, Label, Static
 
 from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
 from kaggler.app.tui.screens import FilePickerScreen
-from kaggler.app.tui.widgets import ChatMessage, TraceLine
+from kaggler.app.tui.widgets import ChatMessage, TraceLine, TraceTable
 from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
 
@@ -102,6 +104,10 @@ class KagglerTUI(App[None]):
         self._flush_timer: Timer | None = None
         # 轮次计数：每轮普通问答 +1，用于打通「消息 ↔ 该轮追溯行」。
         self._turn_id: int = 0
+        # 当前 node_active 建的活动行，等它的 node_done 到来时原地收尾（▶→✓）。
+        self._active_trace: TraceLine | None = None
+        # 活动行对应的节点名，防止串行错配到别的节点的 node_done。
+        self._active_trace_node: str | None = None
 
     # ── 布局 ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -303,6 +309,9 @@ class KagglerTUI(App[None]):
                 widget.remove()
         self._streaming_buf = ""
         self._streaming_dirty = False
+        # 本轮收尾：清空活动行引用，避免下一轮的 node_done 误改这条已定稿的行。
+        self._active_trace = None
+        self._active_trace_node = None
         if self._flush_timer is not None:
             self._flush_timer.pause()
 
@@ -320,38 +329,56 @@ class KagglerTUI(App[None]):
         inp.disabled = False
         inp.focus()
 
-    # ── Agent 行为追溯（右栏 append-only，逐行 TraceLine）────────────────────
+    # ── Agent 行为追溯（每个节点访问一条，原地 ▶→✓ 收尾）──────────────────────
     def _handle_node_active(self, node: str) -> None:
+        # node_active：建一条「▶ 生成中…」行并记为活动行，等 node_done 原地收尾。
         if node in _SILENT_NODES:
             return
         label = _NODE_LABELS.get(node, node)
-        self._write_trace("▶", "yellow", label, "生成中…")
+        tl = TraceLine(
+            self._trace_text("▶", "yellow", label, "生成中…"), turn_id=self._turn_id
+        )
+        # 先存引用再 mount：mount() 返回 AwaitMount 而非部件本身。
+        self._active_trace = tl
+        self._active_trace_node = node
+        self.query_one("#agent-trace", VerticalScroll).mount(tl)
 
     def _handle_node_done(self, node: str, tool_calls: list[dict]) -> None:
+        # node_done：把本节点的活动行原地改成「✓ 完成」；react 决策的工具批次内联成表。
         if node in _SILENT_NODES:
             return
         label = _NODE_LABELS.get(node, node)
-        # 一个 react 节点可能并行发起多个工具调用，逐个成行，避免只追溯到第一个。
-        if tool_calls:
-            for tc in tool_calls:
-                self._write_trace("✓", "green", label, self._fmt_tool_call(tc))
+        done = self._trace_text("✓", "green", label, _NODE_DESC.get(node, "完成"))
+        log = self.query_one("#agent-trace", VerticalScroll)
+        if self._active_trace is not None and self._active_trace_node == node:
+            self._active_trace.update(done)  # 原地收尾：▶→✓、黄→绿、生成中→完成
         else:
-            self._write_trace("✓", "green", label, _NODE_DESC.get(node, "完成"))
+            # 兜底：没有匹配的活动行（不该发生），退化为新挂一条完成行。
+            log.mount(TraceLine(done, turn_id=self._turn_id))
+        if tool_calls:
+            log.mount(
+                TraceTable(self._build_tool_table(tool_calls), turn_id=self._turn_id)
+            )
+        self._active_trace = None
+        self._active_trace_node = None
 
-    def _write_trace(self, icon: str, icon_color: str, label: str, desc: str) -> None:
-        line = Text.assemble(
+    def _trace_text(self, icon: str, icon_color: str, label: str, desc: str) -> Text:
+        return Text.assemble(
             (f"{icon} ", icon_color),
             (f"{str(label):<{_LABEL_WIDTH}}", "cyan"),
             (desc, ""),
         )
-        log = self.query_one("#agent-trace", VerticalScroll)
-        log.mount(TraceLine(line, turn_id=self._turn_id))
 
-    def _fmt_tool_call(self, tc: dict) -> str:
-        name = tc.get("name", "")
-        args = tc.get("args", {})
-        arg_str = ", ".join(f"{k}='{v}'" for k, v in list(args.items())[:2])
-        return f"{name}({arg_str})" if arg_str else f"{name}()"
+    def _build_tool_table(self, tool_calls: list[dict]) -> Table:
+        # 窄栏（3fr）：轻量线框 + 撑满栏宽 + 长文换行不裁断。
+        table = Table(box=box.SIMPLE, expand=True, pad_edge=False, show_edge=True)
+        table.add_column("工具", style="cyan", overflow="fold")
+        table.add_column("参数", overflow="fold")
+        for tc in tool_calls:
+            args = tc.get("args", {})
+            arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "—"
+            table.add_row(tc.get("name", ""), arg_str)
+        return table
 
 
 def main() -> None:

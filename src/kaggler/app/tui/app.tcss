@@ -68,6 +68,13 @@ TraceLine.linked {
     background: $accent-darken-2;
 }
 
+/* react 决策的一批 tool_calls 内联表格（工具名 | 参数）。
+   TraceLine.linked 经基类匹配对它同样生效，联动高亮无需额外规则。 */
+TraceTable {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
 #bottom-bar {
     dock: bottom;
     height: auto;

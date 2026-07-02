@@ -17,9 +17,28 @@ VerticalScroll#chat-log {
     border-right: tall $panel;
 }
 
-#chat-log > Static {
+/* 每条对话消息：可点击元素，selected 为点击选中态。
+   注意：不要给 ChatMessage 加 :hover 规则——hover 伪类切换会对整个消息子树做
+   全量 CSS 重算+重绘（定稿后正文是 Markdown 部件，后代数百个），滚轮滚动时
+   悬停部件不断变化，代价随消息体量增长，直接导致滚动卡顿。 */
+ChatMessage {
     height: auto;
     margin-bottom: 1;
+    padding: 0 1;
+}
+
+ChatMessage.selected {
+    border-left: thick $accent;
+}
+
+/* 正文：收紧 Markdown 部件默认块间距、背景透明以配合 hover 高亮。 */
+ChatMessage .msg-body {
+    margin: 0;
+}
+
+ChatMessage Markdown {
+    margin: 0;
+    background: transparent;
 }
 
 /* 右栏：Agent 行为追溯 */
@@ -35,9 +54,18 @@ VerticalScroll#chat-log {
     text-style: bold;
 }
 
-RichLog#agent-trace {
+VerticalScroll#agent-trace {
     height: 1fr;
     padding: 0 1;
+}
+
+/* 单行追溯：linked 为「与被点消息同轮」的联动高亮态。 */
+TraceLine {
+    height: auto;
+}
+
+TraceLine.linked {
+    background: $accent-darken-2;
 }
 
 #bottom-bar {

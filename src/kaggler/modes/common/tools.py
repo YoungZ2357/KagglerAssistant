@@ -60,6 +60,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
                 ],
             })
 
+        data.set_head(version)
         info = data.get_version_info(version)
         return Command(update={
             "data_version": version,

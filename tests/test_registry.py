@@ -16,7 +16,8 @@ class TestRegistry:
 
     def test_tool_factory_produces_tools(self):
         data = DataProvider()
-        data._frames[0] = pl.DataFrame({"a": [1, 2]})
+        df = pl.DataFrame({"a": [1, 2]})
+        data.add_source(lambda: df, description="test")
         tools = REGISTRY[Mode.EDA].tool_factory(data)
         assert isinstance(tools, list)
         assert tools

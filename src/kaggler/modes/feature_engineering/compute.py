@@ -4,7 +4,7 @@ import numpy as np
 import polars as pl
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 
 from kaggler.shared.serialization import safe_val
 from kaggler.modes.feature_engineering.types import (
@@ -66,12 +66,15 @@ def exec_empty(
             "details": dtype_errors,
         }
 
-    result_df = df.clone()
-    nulls_before = {col: result_df[col].null_count() for pair in pairs for col in [pair["column"]]}
+    nulls_before: dict[str, int] = {}
+    for pair in pairs:
+        col = pair["column"]
+        if col not in nulls_before:
+            nulls_before[col] = df[col].null_count()
 
-    fill_exprs = []
-    delete_columns = []
-    summary = []
+    fill_specs: list[dict] = []
+    delete_columns: list[str] = []
+    skip_summary: list[dict] = []
 
     for pair in pairs:
         col = pair["column"]
@@ -84,61 +87,82 @@ def exec_empty(
 
         if action == FillMethod.ZERO:
             if dtype.is_numeric():
-                fill_exprs.append(pl.col(col).fill_null(0))
+                fill_specs.append({"column": col, "type": "zero", "value": 0})
             elif dtype == pl.String:
-                fill_exprs.append(pl.col(col).fill_null("0"))
+                fill_specs.append({"column": col, "type": "zero", "value": "0"})
             elif dtype == pl.Boolean:
-                fill_exprs.append(pl.col(col).fill_null(False))
+                fill_specs.append({"column": col, "type": "zero", "value": False})
             else:
-                summary.append({
+                skip_summary.append({
                     "column": col,
                     "method": action.value,
                     "nulls_before": nulls_before[col],
                     "nulls_filled": 0,
                     "warnings": [f"列类型 {dtype} 不支持零值填充，已跳过"],
                 })
-                continue
-        elif action == FillMethod.AVG:
-            fill_exprs.append(pl.col(col).fill_null(pl.col(col).mean()))
-        elif action == FillMethod.MEDIAN:
-            fill_exprs.append(pl.col(col).fill_null(pl.col(col).median()))
-        elif action == FillMethod.MODE:
-            mode_val = result_df[col].drop_nulls().mode()
+            continue
+
+        if action == FillMethod.AVG:
+            fill_specs.append({"column": col, "type": "mean"})
+            continue
+
+        if action == FillMethod.MEDIAN:
+            fill_specs.append({"column": col, "type": "median"})
+            continue
+
+        if action == FillMethod.MODE:
+            mode_val = df[col].drop_nulls().mode()
             if mode_val is not None and mode_val.len() > 0:
-                fill_val = mode_val[0]
-                fill_exprs.append(pl.col(col).fill_null(fill_val))
+                fill_specs.append({"column": col, "type": "mode", "value": mode_val[0]})
             else:
-                summary.append({
+                skip_summary.append({
                     "column": col,
                     "method": action.value,
                     "nulls_before": nulls_before[col],
                     "nulls_filled": 0,
                     "warnings": ["列全部为空值，无法确定众数，已跳过"],
                 })
-                continue
-
-    if fill_exprs:
-        result_df = result_df.with_columns(fill_exprs)
-
-    for pair in pairs:
-        col = pair["column"]
-        action = FillMethod(pair["action"])
-        if action == FillMethod.DELETE:
             continue
-        col_summary = {
+
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        exprs = []
+        for spec in fill_specs:
+            col = spec["column"]
+            if spec["type"] == "zero":
+                exprs.append(pl.col(col).fill_null(spec["value"]))
+            elif spec["type"] == "mean":
+                exprs.append(pl.col(col).fill_null(pl.col(col).mean()))
+            elif spec["type"] == "median":
+                exprs.append(pl.col(col).fill_null(pl.col(col).median()))
+            elif spec["type"] == "mode":
+                exprs.append(pl.col(col).fill_null(spec["value"]))
+        if exprs:
+            lf = lf.with_columns(exprs)
+        if delete_columns:
+            lf = lf.filter(
+                pl.all_horizontal([pl.col(c).is_not_null() for c in delete_columns])
+            )
+        return lf
+
+    result_df = _op(df.lazy()).collect()
+
+    summary: list[dict] = list(skip_summary)
+    _method_names = {"zero": "zero", "mean": "avg", "median": "median", "mode": "mode"}
+    for spec in fill_specs:
+        col = spec["column"]
+        if any(s.get("column") == col for s in summary):
+            continue
+        nulls_after = result_df[col].null_count()
+        summary.append({
             "column": col,
-            "method": action.value,
+            "method": _method_names[spec["type"]],
             "nulls_before": nulls_before[col],
-        }
-        if not any(s["column"] == col for s in summary):
-            nulls_after = result_df[col].null_count()
-            col_summary["nulls_filled"] = nulls_before[col] - nulls_after
-            col_summary["warnings"] = []
-            summary.append(col_summary)
+            "nulls_filled": nulls_before[col] - nulls_after,
+            "warnings": [],
+        })
 
     if delete_columns:
-        rows_before = result_df.height
-        result_df = result_df.drop_nulls(subset=delete_columns)
+        rows_before = df.height
         rows_after = result_df.height
         for col in delete_columns:
             summary.append({
@@ -155,7 +179,7 @@ def exec_empty(
         preview.append({k: safe_val(v) for k, v in row.items()})
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -187,7 +211,7 @@ def exec_encode(
         pairs: 列-方法对，每项 {"column": <列名>, "action": "one_hot"|"label"}
 
     Returns:
-        dict: 包含 processed_df, preview, summary, rows_before, rows_after
+        dict: 包含 op, preview, summary, rows_before, rows_after
     """
     schema = df.schema
     columns_set = set(schema.names())
@@ -216,17 +240,17 @@ def exec_encode(
             "details": action_errors,
         }
 
-    result_df = df.clone()
     columns_to_drop = []
     summary = []
+    encode_specs: list[dict] = []
 
     for pair in pairs:
         col = pair["column"]
         action = EncodeMethod(pair["action"])
 
         if action == EncodeMethod.ONE_HOT:
-            null_count = result_df[col].null_count()
-            non_null_vals = result_df[col].drop_nulls().unique()
+            null_count = df[col].null_count()
+            non_null_vals = df[col].drop_nulls().unique()
             unique_count = len(non_null_vals)
 
             warnings = []
@@ -247,19 +271,17 @@ def exec_encode(
             if unique_count <= 1:
                 warnings.append("列仅有一个唯一值，drop_first 后无新列生成")
 
-            null_mask = result_df[col].is_null()
-
-            dummies = result_df.select(pl.col(col)).to_dummies(col, drop_first=True)
+            # 用 to_dummies 提前确定 drop_first 后的列名（兼容旧行为）
+            dummies = df.select(pl.col(col)).to_dummies(col, drop_first=True)
             dummy_cols = [c for c in dummies.columns if not c.endswith("_null")]
-            dummies = dummies.select(dummy_cols)
+            kept_values = [dc[len(col) + 1:] for dc in dummy_cols]
 
-            if null_count > 0:
-                for dc in dummy_cols:
-                    dummies = dummies.with_columns(
-                        pl.when(null_mask).then(None).otherwise(pl.col(dc)).alias(dc)
-                    )
-
-            result_df = result_df.with_columns(dummies)
+            encode_specs.append({
+                "column": col,
+                "type": "one_hot",
+                "values": kept_values,
+                "has_nulls": null_count > 0,
+            })
             columns_to_drop.append(col)
 
             summary.append({
@@ -271,7 +293,7 @@ def exec_encode(
             })
 
         elif action == EncodeMethod.LABEL:
-            vals = result_df[col].drop_nulls().unique().to_list()
+            vals = df[col].drop_nulls().unique().to_list()
             unique_sorted = sorted(vals)
             if not unique_sorted:
                 summary.append({
@@ -284,17 +306,11 @@ def exec_encode(
 
             mapping = {v: i for i, v in enumerate(unique_sorted)}
 
-            result_df = result_df.with_columns(
-                pl.when(pl.col(col).is_null())
-                .then(None)
-                .otherwise(pl.col(col).replace_strict(
-                    old=list(mapping.keys()),
-                    new=list(mapping.values()),
-                    default=None,
-                ))
-                .cast(pl.Int64)
-                .alias(col)
-            )
+            encode_specs.append({
+                "column": col,
+                "type": "label",
+                "mapping": mapping,
+            })
 
             summary.append({
                 "column": col,
@@ -303,8 +319,48 @@ def exec_encode(
                 "warnings": [],
             })
 
-    if columns_to_drop:
-        result_df = result_df.drop(columns_to_drop)
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        exprs = []
+        for spec in encode_specs:
+            col = spec["column"]
+            if spec["type"] == "one_hot":
+                for v in spec["values"]:
+                    name = f"{col}_{v}"
+                    if spec["has_nulls"]:
+                        exprs.append(
+                            pl.when(pl.col(col) == pl.lit(v))
+                            .then(pl.lit(True))
+                            .when(pl.col(col).is_not_null())
+                            .then(pl.lit(False))
+                            .otherwise(pl.lit(None))
+                            .alias(name)
+                        )
+                    else:
+                        exprs.append(
+                            (pl.col(col) == pl.lit(v)).alias(name)
+                        )
+            elif spec["type"] == "label":
+                mapping = spec["mapping"]
+                exprs.append(
+                    pl.when(pl.col(col).is_null())
+                    .then(None)
+                    .otherwise(
+                        pl.col(col).replace_strict(
+                            old=list(mapping.keys()),
+                            new=list(mapping.values()),
+                            default=None,
+                        )
+                    )
+                    .cast(pl.Int64)
+                    .alias(col)
+                )
+        if exprs:
+            lf = lf.with_columns(exprs)
+        if columns_to_drop:
+            lf = lf.drop(columns_to_drop)
+        return lf
+
+    result_df = _op(df.lazy()).collect()
 
     preview_rows = result_df.head(3).to_dicts()
     preview = []
@@ -312,24 +368,12 @@ def exec_encode(
         preview.append({k: safe_val(v) for k, v in row.items()})
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
         "rows_after": result_df.height,
     }
-
-
-def standardize_numeric(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
-    if not columns:
-        return df.clone()
-    arr = df.select(columns).to_numpy()
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(arr)
-    result = df.clone()
-    for i, col in enumerate(columns):
-        result = result.with_columns(pl.Series(col, scaled[:, i]))
-    return result
 
 
 def exec_standardize(
@@ -358,7 +402,21 @@ def exec_standardize(
             "error": f"以下列存在空值，请先使用 execute_empty_value 处理：{null_columns}",
         }
 
-    result_df = standardize_numeric(df, columns)
+    # 拟合阶段：计算每列 mean / std
+    stats: dict[str, tuple[float, float]] = {}
+    for c in columns:
+        col_mean = df[c].mean()
+        col_std = df[c].std()
+        stats[c] = (col_mean, col_std)
+
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        exprs = []
+        for c in columns:
+            mean, std = stats[c]
+            exprs.append(((pl.col(c) - mean) / std).alias(c))
+        return lf.with_columns(exprs)
+
+    result_df = _op(df.lazy()).collect()
 
     preview_rows = result_df.head(3).to_dicts()
     preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
@@ -369,7 +427,7 @@ def exec_standardize(
     }]
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -395,7 +453,10 @@ def exec_drop_columns(
             "hint": "请先调用 explore_schema 确认列名。",
         }
 
-    result_df = df.drop(columns)
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.drop(columns)
+
+    result_df = _op(df.lazy()).collect()
 
     warnings = []
     if result_df.width == 0:
@@ -411,7 +472,7 @@ def exec_drop_columns(
     }]
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -563,10 +624,15 @@ def exec_filter_rows(
 
     combined_expr = combined_expr.fill_null(False)
 
-    if action_enum == RowAction.KEEP:
-        result_df = df.filter(combined_expr)
-    else:
-        result_df = df.filter(~combined_expr)
+    keep = action_enum == RowAction.KEEP
+
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        if keep:
+            return lf.filter(combined_expr)
+        else:
+            return lf.filter(~combined_expr)
+
+    result_df = _op(df.lazy()).collect()
 
     preview_rows = result_df.head(3).to_dicts()
     preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
@@ -580,7 +646,7 @@ def exec_filter_rows(
     }]
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -622,9 +688,21 @@ def exec_dim_reduct(
                 ),
             }
 
-        working_df = df.clone()
+        # 拟合阶段：Polars 标准化参数（非 sklearn StandardScaler）
+        std_stats: dict[str, tuple[float, float]] = {}
         if standardize:
-            working_df = standardize_numeric(working_df, numeric_cols)
+            for c in numeric_cols:
+                std_stats[c] = (df[c].mean(), df[c].std())
+
+        if standardize:
+            working_df = df.clone()
+            std_exprs = []
+            for c in numeric_cols:
+                m, s = std_stats[c]
+                std_exprs.append(((pl.col(c) - m) / s).alias(c))
+            working_df = working_df.with_columns(std_exprs)
+        else:
+            working_df = df.clone()
 
         arr = working_df.select(numeric_cols).to_numpy()
         if np.any(np.isnan(arr)):
@@ -633,24 +711,40 @@ def exec_dim_reduct(
             }
 
         pca = PCA(n_components=n_components)
-        transformed = pca.fit_transform(arr)
-        if transformed.ndim == 1:
-            transformed = transformed.reshape(-1, 1)
+        pca.fit(arr)
 
         pc_cols = [f"PC{i + 1}" for i in range(n_components)]
-        final_cols = [c for c in df.columns if c not in numeric_cols] + pc_cols
+        non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
+        final_cols = non_numeric_cols + pc_cols
 
-        drop_cols = [c for c, d in schema.items() if c in numeric_cols]
-        result_df = df.clone().drop(drop_cols)
-        pc_df = pl.from_numpy(transformed, schema=pc_cols)
-        if result_df.width == 0:
-            result_df = pc_df
-        else:
-            dupes = [c for c in pc_cols if c in result_df.columns]
-            if dupes:
-                result_df = result_df.drop(dupes)
-            result_df = result_df.hstack(pc_df)
-        result_df = result_df.select(final_cols)
+        weights: list[tuple[float, list[float]]] = []
+        for i in range(n_components):
+            bias = 0.0
+            ws: list[float] = []
+            for j, c in enumerate(numeric_cols):
+                w = float(pca.components_[i, j])
+                if standardize:
+                    m, s = std_stats[c]
+                    w = w / s
+                    bias -= (m / s + float(pca.mean_[j])) * float(pca.components_[i, j])
+                else:
+                    bias -= float(pca.mean_[j]) * float(pca.components_[i, j])
+                ws.append(w)
+            weights.append((bias, ws))
+
+        explained_var = [round(float(v), 6) for v in pca.explained_variance_ratio_]
+
+        def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+            exprs = []
+            for i, (bias_val, ws) in enumerate(weights):
+                expr = pl.lit(bias_val)
+                for j, c in enumerate(numeric_cols):
+                    if ws[j] != 0.0:
+                        expr = expr + pl.col(c) * ws[j]
+                exprs.append(expr.alias(pc_cols[i]))
+            return lf.with_columns(exprs).select(final_cols)
+
+        result_df = _op(df.lazy()).collect()
 
         preview_rows = result_df.head(3).to_dicts()
         preview = [
@@ -662,14 +756,12 @@ def exec_dim_reduct(
             "n_components": n_components,
             "original_features": numeric_cols,
             "new_columns": pc_cols,
-            "explained_variance_ratio": [
-                round(float(v), 6) for v in pca.explained_variance_ratio_
-            ],
+            "explained_variance_ratio": explained_var,
             "standardized": standardize,
         }]
 
         return {
-            "processed_df": result_df,
+            "op": _op,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -716,9 +808,20 @@ def exec_dim_reduct(
                 ),
             }
 
-        working_df = df_clean.clone()
+        std_stats: dict[str, tuple[float, float]] = {}
         if standardize:
-            working_df = standardize_numeric(working_df, numeric_cols)
+            for c in numeric_cols:
+                std_stats[c] = (df_clean[c].mean(), df_clean[c].std())
+
+        if standardize:
+            working_df = df_clean.clone()
+            std_exprs = []
+            for c in numeric_cols:
+                m, s = std_stats[c]
+                std_exprs.append(((pl.col(c) - m) / s).alias(c))
+            working_df = working_df.with_columns(std_exprs)
+        else:
+            working_df = df_clean.clone()
 
         X = working_df.select(numeric_cols).to_numpy()
         if np.any(np.isnan(X)):
@@ -731,7 +834,8 @@ def exec_dim_reduct(
         y_encoded = le.fit_transform(y.astype(str))
 
         lda = LinearDiscriminantAnalysis(n_components=n_components)
-        transformed = lda.fit_transform(X, y_encoded)
+        lda.fit(X, y_encoded)
+        transformed = lda.transform(X)
         if transformed.ndim == 1:
             transformed = transformed.reshape(-1, 1)
         if transformed.shape[1] == 0:
@@ -748,16 +852,32 @@ def exec_dim_reduct(
         keep_cols = [c for c in df.columns if c not in numeric_cols]
         final_cols = keep_cols + ld_cols
 
-        result_df = df_clean.clone().drop(numeric_cols)
-        ld_df = pl.from_numpy(transformed, schema=ld_cols)
-        if result_df.width == 0:
-            result_df = ld_df
-        else:
-            dupes = [c for c in ld_cols if c in result_df.columns]
-            if dupes:
-                result_df = result_df.drop(dupes)
-            result_df = result_df.hstack(ld_df)
-        result_df = result_df.select(final_cols)
+        weights: list[tuple[float, list[float]]] = []
+        for i in range(n_components):
+            bias = 0.0
+            ws: list[float] = []
+            for j, c in enumerate(numeric_cols):
+                w = float(lda.scalings_[j, i])
+                if standardize:
+                    m, s = std_stats[c]
+                    w = w / s
+                    bias -= (m / s + float(lda.xbar_[j])) * float(lda.scalings_[j, i])
+                else:
+                    bias -= float(lda.xbar_[j]) * float(lda.scalings_[j, i])
+                ws.append(w)
+            weights.append((bias, ws))
+
+        def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+            exprs = []
+            for i, (bias_val, ws) in enumerate(weights):
+                expr = pl.lit(bias_val)
+                for j, c in enumerate(numeric_cols):
+                    if ws[j] != 0.0:
+                        expr = expr + pl.col(c) * ws[j]
+                exprs.append(expr.alias(ld_cols[i]))
+            return lf.with_columns(exprs).select(final_cols)
+
+        result_df = _op(df_clean.lazy()).collect()
 
         preview_rows = result_df.head(3).to_dicts()
         preview = [
@@ -776,7 +896,7 @@ def exec_dim_reduct(
         }]
 
         return {
-            "processed_df": result_df,
+            "op": _op,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -886,13 +1006,18 @@ def exec_transform_mono(
             "hint": "请为 output_name 指定不冲突的名称。",
         }
 
-    result_df = df.clone()
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        exprs = []
+        for spec, out in zip(specs, resolved):
+            method = MonoTransform(spec["method"])
+            expr = _MONO_EXPR[method](pl.col(spec["column"]), spec)
+            exprs.append(expr.alias(out))
+        return lf.with_columns(exprs)
+
+    result_df = _op(df.lazy()).collect()
     summary = []
     for spec, out in zip(specs, resolved):
         method = MonoTransform(spec["method"])
-        expr = _MONO_EXPR[method](pl.col(spec["column"]), spec)
-        result_df = result_df.with_columns(expr.alias(out))
-
         warnings = []
         nan_count, inf_count = _count_bad(result_df[out])
         if nan_count:
@@ -915,7 +1040,7 @@ def exec_transform_mono(
     preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -964,9 +1089,12 @@ def exec_transform_combination(
             "hint": "请为 output_name 指定不冲突的名称。",
         }
 
-    exprs = [pl.col(c) for c in columns]
-    combined_expr = _COMBO_EXPR[method_enum](exprs)
-    result_df = df.with_columns(combined_expr.alias(output_name))
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        exprs = [pl.col(c) for c in columns]
+        combined = _COMBO_EXPR[method_enum](exprs)
+        return lf.with_columns(combined.alias(output_name))
+
+    result_df = _op(df.lazy()).collect()
 
     warnings = []
     nan_count, inf_count = _count_bad(result_df[output_name])
@@ -986,7 +1114,7 @@ def exec_transform_combination(
     preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
 
     return {
-        "processed_df": result_df,
+        "op": _op,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,

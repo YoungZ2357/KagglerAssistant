@@ -17,20 +17,21 @@ from kaggler.persistence.data_provider import DataProvider
 @pytest.fixture
 def data() -> DataProvider:
     dp = DataProvider()
-    dp._frames[0] = pl.DataFrame(
+    df = pl.DataFrame(
         {
             "x": [1.0, 2.0, 3.0, 4.0, 5.0],
             "y": [10.0, 20.0, 30.0, 40.0, 50.0],
             "cat": ["a", "b", "c", "d", "e"],
         }
     )
+    dp.add_source(lambda: df, description="test")
     return dp
 
 
 @pytest.fixture
 def data_multi() -> DataProvider:
     dp = DataProvider()
-    dp._frames[0] = pl.DataFrame(
+    df = pl.DataFrame(
         {
             "f1": [1.0, 2.0, 3.0, 6.0, 7.0, 8.0],
             "f2": [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
@@ -38,6 +39,7 @@ def data_multi() -> DataProvider:
             "label": ["a", "a", "a", "b", "b", "b"],
         }
     )
+    dp.add_source(lambda: df, description="test")
     return dp
 
 

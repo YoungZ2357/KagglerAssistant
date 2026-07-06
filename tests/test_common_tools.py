@@ -6,22 +6,28 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from kaggler.modes.common.tools import make_tools
-from kaggler.persistence.data_provider import DataProvider, VersionInfo
+from kaggler.persistence.data_provider import DataProvider
 from kaggler.shared.types import Mode
 
 
 @pytest.fixture
 def data() -> DataProvider:
     dp = DataProvider()
-    dp._frames[0] = pl.DataFrame({"a": [1, 2, 3]})
-    dp._version_info[0] = VersionInfo(parent=None, tool=None, description="原始数据集")
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    dp.add_source(lambda: df, description="原始数据集")
     return dp
 
 
 @pytest.fixture
 def data_multi_version(data) -> DataProvider:
-    data.add_version(pl.DataFrame({"a": [1, 2]}), parent=0, tool="drop_columns", description="删除了1行")
-    data.add_version(pl.DataFrame({"a": [1]}), parent=1, tool="filter_rows", description="再删除了1行")
+    data.add_version(
+        DataProvider.eager_op(lambda _: pl.DataFrame({"a": [1, 2]})),
+        parent=0, tool="drop_columns", description="删除了1行",
+    )
+    data.add_version(
+        DataProvider.eager_op(lambda _: pl.DataFrame({"a": [1]})),
+        parent=1, tool="filter_rows", description="再删除了1行",
+    )
     return data
 
 

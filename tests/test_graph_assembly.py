@@ -13,7 +13,8 @@ from kaggler.persistence.data_provider import DataProvider
 @pytest.fixture
 def loaded_data() -> DataProvider:
     data = DataProvider()
-    data._frames[0] = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    data.add_source(lambda: df, description="test")
     return data
 
 

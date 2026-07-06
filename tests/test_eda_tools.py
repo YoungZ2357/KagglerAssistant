@@ -9,7 +9,8 @@ from kaggler.persistence.data_provider import DataProvider
 @pytest.fixture
 def data(df_mixed) -> DataProvider:
     dp = DataProvider()
-    dp._frames[0] = df_mixed
+    df = df_mixed
+    dp.add_source(lambda: df, description="test")
     return dp
 
 

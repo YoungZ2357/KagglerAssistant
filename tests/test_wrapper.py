@@ -10,7 +10,7 @@
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from kaggler.shared import wrapper as wrapper_mod
 from kaggler.shared.types import Mode
@@ -148,6 +148,48 @@ class TestStreamEvents:
         events = list(session.stream_events("q"))
 
         assert events == [{"type": "node_done", "node": "finish", "tool_calls": []}]
+
+    def test_updates_list_shape_does_not_crash(self, make_session):
+        # ToolNode 一次执行多个工具且含返回 Command 的工具时，updates payload 是
+        # list[dict] 而非 dict——历史上会崩 "'list' object has no attribute 'get'"。
+        # 现应正常归一化处理，并从 list 中抽出 current_mode 发 mode_change。
+        state_update = [
+            {"current_mode": Mode.FEAT_ENG},
+            {"messages": [ToolMessage("switched", tool_call_id="1")]},
+            {"messages": [ToolMessage("plain", tool_call_id="2")]},
+        ]
+        script = [("updates", {"tools": state_update})]
+        session = make_session(script)
+        events = list(session.stream_events("q"))
+
+        assert events == [
+            {"type": "mode_change", "mode": str(Mode.FEAT_ENG)},
+            {"type": "node_done", "node": "tools", "tool_calls": []},
+        ]
+
+    def test_updates_list_takes_last_current_mode(self, make_session):
+        # list 内多次写 current_mode 时，mode_change 取最后一个（与 reducer 语义一致）
+        state_update = [
+            {"current_mode": Mode.FEAT_ENG},
+            {"current_mode": Mode.EDA},
+        ]
+        script = [("updates", {"tools": state_update})]
+        session = make_session(script)
+        events = list(session.stream_events("q"))
+
+        assert {"type": "mode_change", "mode": str(Mode.EDA)} in events
+        assert {"type": "mode_change", "mode": str(Mode.FEAT_ENG)} not in events
+
+    def test_updates_list_with_non_dict_entries_skipped(self, make_session):
+        # list 中混入非 dict 元素也不应崩溃
+        script = [("updates", {"tools": [None, {"current_mode": Mode.EDA}]})]
+        session = make_session(script)
+        events = list(session.stream_events("q"))
+
+        assert events == [
+            {"type": "mode_change", "mode": str(Mode.EDA)},
+            {"type": "node_done", "node": "tools", "tool_calls": []},
+        ]
 
     def test_updates_resets_current_node(self, make_session):
         # updates 批次后，再遇到同名节点的 messages 应重新报 node_active

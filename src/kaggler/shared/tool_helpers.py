@@ -23,7 +23,7 @@ def commit_mutation(
     """写工具的统一收尾。
 
     compute 层约定：失败返回含 ``"error"`` 键的 dict；成功返回含
-    ``processed_df`` 及 ``rows_before/rows_after/preview/summary`` 的 dict。
+    ``op`` 及 ``rows_before/rows_after/preview/summary`` 的 dict。
     - 失败：原样回一条 ToolMessage，不改数据版本，不记录谱系。
     - 成功：登记新版本 + 谱系（parent_version/tool_name/description 由调用方
       即各 FE 工具显式提供），回摘要并推进 ``data_version``。
@@ -36,7 +36,7 @@ def commit_mutation(
         })
 
     new_version = data.add_version(
-        result["processed_df"],
+        result["op"],
         parent=parent_version,
         tool=tool_name,
         description=description,

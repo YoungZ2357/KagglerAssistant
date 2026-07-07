@@ -92,14 +92,26 @@ class AgentSession:
                 # updates 批次边界：清空当前节点，使下一次 messages 事件能重新报 active
                 current_node = None
                 for node_name, state_update in data.items():
+                    # 单个节点在同一 super-step 内产生多条写入时，state_update 是
+                    # list[dict] 而非 dict——典型触发：ToolNode 一次执行多个工具且其中
+                    # 至少一个返回 Command（本项目的 switch_mode / switch_data_version）。
+                    # 详见 langgraph ToolNode._combine_tool_outputs。统一成 list 再逐条处理，
+                    # 否则对 list 调 .get 会抛 "'list' object has no attribute 'get'"。
+                    updates = state_update if isinstance(state_update, list) else [state_update]
                     tool_calls: list[dict] = []
-                    for msg in (state_update or {}).get("messages", []):
-                        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
-                            tool_calls = [
-                                {"name": tc["name"], "args": tc["args"]}
-                                for tc in msg.tool_calls
-                            ]
-                    new_mode = (state_update or {}).get("current_mode")
+                    new_mode = None
+                    for upd in updates:
+                        if not isinstance(upd, dict):
+                            continue
+                        for msg in upd.get("messages", []):
+                            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                                tool_calls = [
+                                    {"name": tc["name"], "args": tc["args"]}
+                                    for tc in msg.tool_calls
+                                ]
+                        mode_upd = upd.get("current_mode")
+                        if mode_upd is not None:
+                            new_mode = mode_upd
                     if new_mode is not None:
                         yield {"type": "mode_change", "mode": str(new_mode)}
                     yield {

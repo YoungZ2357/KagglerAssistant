@@ -13,6 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import polars as pl
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
 from kaggler.graph.assembly import make_sqlite_saver
@@ -24,6 +25,10 @@ from kaggler.workspace.manager import (
     get_active_workspace,
     set_active_workspace,
 )
+
+# 确保 DEEPSEEK_API_KEY 等环境变量在 _generate_name 调用 make_llm_raw 之前已加载。
+# build_graph 内部也会 load_dotenv，但 _generate_name 在其之前执行，故在此也加载一次。
+load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
 _SAMPLE_ROWS = 5
 _NAME_PROMPT = (
@@ -39,7 +44,9 @@ def _generate_name(csv_path: str) -> str:
     """基于 CSV 的结构与样本数据，调用轻量 LLM 生成对话名称。"""
     filename = Path(csv_path).stem
     try:
-        df = pl.read_csv(csv_path)
+        # 只需列名 + 前几行；n_rows 限定读取量，避免为命名而全量载入大数据集
+        # （与项目「改用 LazyFrame」的方向一致）。
+        df = pl.read_csv(csv_path, n_rows=_SAMPLE_ROWS)
     except Exception:
         return filename
 
@@ -53,8 +60,13 @@ def _generate_name(csv_path: str) -> str:
 
     prompt = _NAME_PROMPT.format(filename=filename, columns=columns, sample=sample)
 
-    llm = make_llm_raw(DeepSeekModel.FLASH, temperature=0.3)
-    response = llm.invoke([HumanMessage(content=prompt)])
+    # LLM 调用可能超时/报错（无网络、API key 失效等）——命名只是锦上添花，
+    # 失败时静默降级到文件名，绝不让自动命名拖垮整个「创建对话」流程。
+    try:
+        llm = make_llm_raw(DeepSeekModel.FLASH, temperature=0.3)
+        response = llm.invoke([HumanMessage(content=prompt)])
+    except Exception:
+        return filename
     name = response.content if isinstance(response.content, str) else str(response.content)
     name = name.strip().strip("\"'").strip("。，,.；;：:！!？?")
     return name[:20] or filename
@@ -132,6 +144,14 @@ class SessionManager:
         if record is None:
             raise KeyError(f"未找到 thread_id={thread_id[:8]} 的对话记录")
 
+        # 先清 LangGraph checkpoint（该 thread 的全部 state/writes），再删应用层元数据。
+        # 顺序刻意如此：若 purge 抛错，元数据行仍在，不会留下「元数据已删但 checkpoint
+        # 还在」的不可见孤儿 thread。delete_thread 由 langgraph-checkpoint-sqlite 提供。
+        saver = make_sqlite_saver(self._workspace.checkpoint_db)
+        try:
+            saver.delete_thread(thread_id)
+        finally:
+            saver.conn.close()
         self._store.delete(thread_id)
 
     def rename_conversation(self, thread_id: str, new_name: str) -> None:

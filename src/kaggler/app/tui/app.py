@@ -43,10 +43,23 @@ from textual.timer import Timer
 from textual.widgets import Header, Input, Label, Static
 
 from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
-from kaggler.app.tui.screens import FilePickerScreen
+from kaggler.app.tui.screens import (
+    ConversationAction,
+    ConversationListScreen,
+    DirectoryBrowserScreen,
+    FilePickerScreen,
+)
 from kaggler.app.tui.widgets import ChatMessage, TraceLine, TraceTable
+from kaggler.modes.common.compute import list_files
+from kaggler.shared.session_manager import SessionManager
 from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
+from kaggler.workspace.manager import (
+    Workspace,
+    get_active_workspace,
+    load_last_workspace,
+    set_active_workspace,
+)
 
 _GREETINGS = ["请讲！", "快点把问题端上来罢", "冲刺！冲刺！冲！冲！"]
 
@@ -96,6 +109,8 @@ class KagglerTUI(App[None]):
         # 注意：不能命名为 `_thread_id` —— 那会覆盖 Textual `App._thread_id`
         # （它存事件循环所在线程的 id，run_worker 据此判断是否需跨线程 marshal）。
         self._session: AgentSession | None = None
+        self._workspace: Workspace | None = None
+        self._session_manager: SessionManager | None = None
         self._streaming_buf: str = ""
         self._streaming_dirty: bool = False
         # 本轮回答对应的消息 widget；token 原地更新它，结束置空。
@@ -141,18 +156,44 @@ class KagglerTUI(App[None]):
         # 滚回底部自动恢复（Textual 内建机制，替代逐次手动 scroll_end）。
         self.query_one("#chat-log", VerticalScroll).anchor()
         self.query_one("#agent-trace", VerticalScroll).anchor()
-        # 不再强制选文件：直接进界面，用 /load-file 按需加载。
-        self._update_file_bar(None)
         self.query_one("#status-bar", Static).update(
             Text("输入 /load-file 加载数据集后开始对话 · 拖选文本后 Ctrl+C 复制", "dim")
         )
-        self._add_message(
-            "system", "尚未加载数据集，输入 /load-file 选择一个 CSV 数据集开始对话。"
-        )
+        # 自动恢复上次工作区：免去每次启动重新 /select-workspace。
+        last = load_last_workspace()
+        if last is not None:
+            self._activate_workspace(last)
+            self._system_msg(
+                f"已恢复上次工作区 {self._workspace.path}，持久化已启用。"
+                "输入 /conversations 查看历史对话，或 /load-file 开始新对话。"
+            )
+        else:
+            self._update_file_bar(None)
+            self._system_msg(
+                "未设置工作区，持久化功能不可用。输入 /select-workspace 选择工作区目录以启用持久化，"
+                "或直接 /load-file 加载数据集（仅内存模式）。"
+            )
         self._enable_input()
 
+    def _activate_workspace(self, path: Path | str) -> None:
+        """设为当前工作区并建好 SessionManager，刷新信息栏。供启动恢复与 /select-workspace 共用。"""
+        self._workspace = set_active_workspace(path)
+        self._session_manager = SessionManager(self._workspace.path)
+        self._update_file_bar(self._session._csv_path if self._session else None)
+
     def _cmd_load_file(self) -> None:
-        self.push_screen(FilePickerScreen(), self._on_file_picked)
+        if self._workspace:
+            self.push_screen(
+                DirectoryBrowserScreen(str(self._workspace.path)),
+                self._on_file_browsed,
+            )
+        else:
+            self.push_screen(FilePickerScreen(), self._on_file_picked)
+
+    def _on_file_browsed(self, path: str | None) -> None:
+        if not path:
+            return
+        self._on_file_picked(path)
 
     def _on_file_picked(self, path: str | None) -> None:
         if not path:
@@ -179,10 +220,30 @@ class KagglerTUI(App[None]):
     # ── Worker 函数（后台线程）─────────────────────────────────────────────
     def _init_worker(self, path: str) -> None:
         try:
-            session = AgentSession(path)
+            if self._session_manager is not None:
+                session = self._session_manager.create_conversation(path)
+            else:
+                session = AgentSession(path)
             self._session = session
             self.post_message(StreamEvent({"type": "init_done", "path": path}))
         except Exception as exc:  # noqa: BLE001 — 后台线程异常需回送到 UI 显示
+            self.post_message(StreamEvent({"type": "error", "message": str(exc)}))
+
+    def _resume_worker(self, thread_id: str) -> None:
+        try:
+            session = self._session_manager.resume_conversation(thread_id)
+            self._session = session
+            self.post_message(
+                StreamEvent(
+                    {
+                        "type": "init_done",
+                        "path": session._csv_path,
+                        "resumed": True,
+                        "history": session.history(),
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
             self.post_message(StreamEvent({"type": "error", "message": str(exc)}))
 
     def _stream_worker(self, question: str) -> None:
@@ -203,7 +264,15 @@ class KagglerTUI(App[None]):
             # 重建会话：清空左栏与右栏追溯、归零轮次（新数据集 = 新对话）。
             self._clear_conversation()
             self._update_file_bar(e.get("path"))
-            self._add_message("assistant", random.choice(_GREETINGS))
+            if e.get("resumed"):
+                self._replay_history(e.get("history") or [])
+                self._add_message(
+                    "system",
+                    "已恢复对话。历史消息已在上方重放；助手仍保留之前的上下文记忆。"
+                    "（注：右栏 Agent 行为追溯不重建；更早被压缩的历史仅存于摘要、不在此显示。）",
+                )
+            else:
+                self._add_message("assistant", random.choice(_GREETINGS))
             self._update_status_bar("eda")
             self._enable_input()
 
@@ -291,6 +360,12 @@ class KagglerTUI(App[None]):
             self._cmd_switch(args)
         elif name == "load-file":
             self._cmd_load_file()
+        elif name == "select-workspace":
+            self._cmd_select_workspace()
+        elif name == "ls":
+            self._cmd_ls(args)
+        elif name == "conversations":
+            self._cmd_conversations()
         elif name == "exit":
             self.exit()
         else:
@@ -313,6 +388,66 @@ class KagglerTUI(App[None]):
         self._session.set_mode(mode)
         self._update_status_bar(mode.value)
         self._system_msg(f"已切换到 {_MODE_LABELS.get(mode.value, mode.value)}")
+
+    def _cmd_select_workspace(self) -> None:
+        self.push_screen(
+            DirectoryBrowserScreen(select_dir_mode=True), self._on_workspace_picked
+        )
+
+    def _on_workspace_picked(self, path: str | None) -> None:
+        if not path:
+            return
+        p = Path(path)
+        if not p.is_dir():
+            self.notify("不是有效目录", severity="error")
+            return
+        self._activate_workspace(p)
+        self._system_msg(f"工作区已设置为 {self._workspace.path}，持久化已启用。")
+
+    def _cmd_ls(self, args: list[str]) -> None:
+        ws = get_active_workspace()
+        if ws is None:
+            self._system_msg("未设置工作区，请先用 /select-workspace 选择工作区目录。")
+            return
+        subdir = args[0] if args else ""
+        target = ws.resolve_within(subdir)
+        if target is None:
+            self._system_msg("不允许访问工作区之外的路径。")
+            return
+        try:
+            output = list_files(target)
+        except Exception as exc:
+            output = f"列出文件失败：{exc}"
+        self._add_message("system", output, markdown=True)
+
+    def _cmd_conversations(self) -> None:
+        if self._session_manager is None:
+            self._system_msg(
+                "未设置工作区，无法管理对话。请先用 /select-workspace 选择工作区目录。"
+            )
+            return
+        records = self._session_manager.list_conversations()
+        self.push_screen(
+            ConversationListScreen(records), self._on_conversation_action
+        )
+
+    def _on_conversation_action(self, result: ConversationAction | None) -> None:
+        if result is None or self._session_manager is None:
+            return
+        if result.action == "resume":
+            self.query_one("#user-input", Input).disabled = True
+            self._add_message("system", "正在恢复对话 …")
+            self.run_worker(
+                lambda: self._resume_worker(result.thread_id),
+                thread=True,
+                name="init",
+            )
+        elif result.action == "rename":
+            self._session_manager.rename_conversation(result.thread_id, result.new_name)
+            self._system_msg(f"已重命名为 {result.new_name}")
+        elif result.action == "delete":
+            self._session_manager.delete_conversation(result.thread_id)
+            self._system_msg("已删除对话")
 
     # ── 流式回答（原地更新当前消息）──────────────────────────────────────
     def _flush_streaming(self) -> None:
@@ -354,28 +489,48 @@ class KagglerTUI(App[None]):
         inp.focus()
 
     def _clear_conversation(self) -> None:
-        """重建会话：清空左栏对话与右栏追溯，归零轮次与活动行引用。"""
+        """重建会话：清空左栏对话与右栏追溯，归零轮次与活动行引用。
+
+        保留 workspace / session_manager 引用（工作区设置不应随数据集切换丢失）。
+        """
         self._turn_id = 0
         self._active_trace = None
         self._active_trace_node = None
         self.query_one("#chat-log", VerticalScroll).remove_children()
         self.query_one("#agent-trace", VerticalScroll).remove_children()
 
-    def _update_file_bar(self, path: str | None) -> None:
-        """刷新顶部文件信息栏：文件名 · 类型 · 绝对路径；未加载则给出提示。"""
-        bar = self.query_one("#file-bar", Static)
-        if not path:
-            bar.update(Text("未加载数据集 · 输入 /load-file 选择 CSV", "dim"))
-            return
-        p = Path(path).resolve()
-        ftype = p.suffix[1:].upper() if p.suffix else "文件"
-        bar.update(
-            Text.assemble(
-                ("📄 ", ""), (p.name, "bold cyan"),
-                ("  ·  ", "dim"), (ftype, "green"),
-                ("  ·  ", "dim"), (str(p), "dim"),
+    def _replay_history(self, history: list[dict[str, str]]) -> None:
+        """恢复对话时把 checkpoint 中的历史消息重绘到左栏（用户/助手两类）。"""
+        for msg in history:
+            role = msg.get("role", "system")
+            self._add_message(
+                role, msg.get("content", ""), markdown=(role == "assistant")
             )
-        )
+
+    def _update_file_bar(self, path: str | None) -> None:
+        """刷新顶部信息栏：工作区路径 + 数据集文件名 · 类型 · 绝对路径。"""
+        bar = self.query_one("#file-bar", Static)
+        segments: list[tuple[str, str]] = []
+
+        if self._workspace:
+            segments.append(("工作区: ", "dim"))
+            segments.append((str(self._workspace.path), "bold magenta"))
+
+        if path:
+            if segments:
+                segments.append(("  ·  ", "dim"))
+            p = Path(path).resolve()
+            ftype = p.suffix[1:].upper() if p.suffix else "文件"
+            segments.append(("", ""))
+            segments.append((p.name, "bold cyan"))
+            segments.append(("  ·  ", "dim"))
+            segments.append((ftype, "green"))
+            segments.append(("  ·  ", "dim"))
+            segments.append((str(p), "dim"))
+        elif not segments:
+            segments.append(("未加载数据集 · 输入 /load-file 选择 CSV", "dim"))
+
+        bar.update(Text.assemble(*segments))
 
     # ── Agent 行为追溯（每个节点访问一条，原地 ▶→✓ 收尾）──────────────────────
     def _handle_node_active(self, node: str) -> None:

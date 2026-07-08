@@ -18,7 +18,6 @@ from kaggler.graph.types import Node
 from kaggler.modes.common.tools import make_tools as make_common_tools
 from kaggler.modes.registry import REGISTRY
 from kaggler.shared.config import GraphConfig, make_llm_raw, DeepSeekModel
-from kaggler.shared.paths import checkpoint_db
 from kaggler.shared.types import Mode
 from kaggler.persistence.data_provider import DataProvider
 
@@ -27,9 +26,14 @@ def make_sqlite_saver(db_path: Path) -> SqliteSaver:
     """从路径创建 SqliteSaver，自动建目录并启用 WAL 模式。
 
     在 composition root（SessionManager）处调用，把 Path 值本身传入。
+
+    ``check_same_thread=False``：连接在某个 worker 线程创建，图却在另一个 worker
+    线程运行（TUI 的 init/stream 是不同线程）。SqliteSaver.__init__ 自带
+    threading.Lock 串行化所有 DB 访问，故单连接跨线程共享是安全的——这是 LangGraph
+    官方用法。缺此 flag 则首次跨线程访问 checkpoint 即抛 sqlite3.ProgrammingError。
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     return SqliteSaver(conn)
 
@@ -97,4 +101,4 @@ def build_graph(
     builder.add_edge(Node.TOOLS, Node.REACT)
     builder.add_edge(Node.FINISH, END)
 
-    return builder.compile(checkpointer=checkpointer or make_sqlite_saver(checkpoint_db()))
+    return builder.compile(checkpointer=checkpointer or MemorySaver())

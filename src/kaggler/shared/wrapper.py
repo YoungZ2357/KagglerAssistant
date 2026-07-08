@@ -57,6 +57,22 @@ class AgentSession:
             self._seeded = True
         return payload
 
+    def history(self) -> list[dict[str, str]]:
+        """从 checkpoint 读出可展示的历史消息，供恢复对话时重绘左栏对话窗。
+
+        只回放「用户提问」与「助手有正文的回复」两类，跳过 ToolMessage、system 与
+        仅含 tool_calls 的空 AIMessage。**局限**：被 summarize 节点压缩掉的更早历史
+        已从 messages 移除（仅存于 summary），故此处只能回放最近一段幸存的消息。
+        """
+        state = self._graph.get_state(self._config)
+        out: list[dict[str, str]] = []
+        for m in state.values.get("messages", []):
+            if isinstance(m, HumanMessage):
+                out.append({"role": "user", "content": str(m.content)})
+            elif isinstance(m, AIMessage) and m.content:
+                out.append({"role": "assistant", "content": str(m.content)})
+        return out
+
     def set_mode(self, mode: Mode) -> None:
         """确定性切换模式（Channel A）：不经 LLM，直接写入图 state。
 

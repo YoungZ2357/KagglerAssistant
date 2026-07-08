@@ -13,7 +13,8 @@ dependencies = [
     "langchain-core",
     "langgraph",
     "langchain-deepseek",
-    "langgraph-checkpoint-sqlite",
+    # 下限保证 SqliteSaver.delete_thread 可用（delete_conversation 依赖它清 checkpoint）
+    "langgraph-checkpoint-sqlite>=3.0",
     # Data Processing
     "polars",
     "polars_ds",

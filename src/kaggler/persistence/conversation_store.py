@@ -45,7 +45,10 @@ class ConversationStore:
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             db_path_str = str(self._db_path)
-            self._conn = sqlite3.connect(db_path_str)
+            # check_same_thread=False：连接可能在某个 worker 线程惰性创建，之后被
+            # UI 主线程调用（如 /conversations 的 rename/delete）。本 store 无内部锁，
+            # 依赖「单消费者、串行调用」假设——TUI 的 worker 逐个启动，不并发写。
+            self._conn = sqlite3.connect(db_path_str, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(_SCHEMA)
@@ -111,21 +114,23 @@ class ConversationStore:
         conn.commit()
 
     def rename(self, thread_id: str, new_name: str) -> bool:
+        # 用 cursor.rowcount（本次语句影响的行数），不是 conn.total_changes——后者是
+        # 连接开启以来的累计值，任意一次 create 之后恒为正，会对不存在的 thread_id 谎报成功。
         conn = self._get_conn()
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE conversations SET name = ?, updated_at = ? WHERE thread_id = ?",
             (new_name, self._now(), thread_id),
         )
         conn.commit()
-        return conn.total_changes > 0
+        return cursor.rowcount > 0
 
     def delete(self, thread_id: str) -> bool:
         conn = self._get_conn()
-        conn.execute(
+        cursor = conn.execute(
             "DELETE FROM conversations WHERE thread_id = ?", (thread_id,)
         )
         conn.commit()
-        return conn.total_changes > 0
+        return cursor.rowcount > 0
 
     def _row_to_record(self, row: sqlite3.Row) -> ConversationRecord:
         return ConversationRecord(

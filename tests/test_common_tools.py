@@ -36,10 +36,13 @@ def _by_name(tools):
 
 
 class TestMakeCommonTools:
-    def test_returns_three_tools(self, data):
+    def test_returns_four_tools(self, data):
         tools = make_tools(data)
-        assert len(tools) == 3
-        assert {t.name for t in tools} == {"switch_mode", "switch_data_version", "list_data_versions"}
+        assert len(tools) == 4
+        assert {t.name for t in tools} == {
+            "switch_mode", "switch_data_version", "list_data_versions",
+            "list_workspace_files",
+        }
 
     def test_tool_has_docstring(self, data):
         assert make_tools(data)[0].description

@@ -5,9 +5,11 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool, InjectedToolCallId
 from langgraph.types import Command
 
+from kaggler.modes.common.compute import list_files
 from kaggler.persistence.data_provider import DataProvider
 from kaggler.shared.tool_helpers import dumps_cn
 from kaggler.shared.types import Mode
+from kaggler.workspace.manager import get_active_workspace
 
 
 def make_tools(data: DataProvider) -> list[BaseTool]:
@@ -89,4 +91,28 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         """
         return dumps_cn(data.list_versions())
 
-    return [switch_mode, switch_data_version, list_data_versions]
+    @tool
+    def list_workspace_files(
+            directory: Annotated[str, "相对于工作区根目录的子路径，默认为 '.'"] = ".",
+    ) -> str:
+        """列出当前工作区指定目录下的所有文件和子目录。
+
+        当需要了解工作区中有哪些数据文件、脚本、输出等资源时调用。
+        目录参数为相对于工作区根目录的路径，默认为工作区根目录 ('')。
+        返回按「目录优先 → 名称升序」排列的格式化列表，含文件大小。
+        仅在已设置工作区时可用；若未设置工作区则返回错误提示。
+
+        使用情景：
+        - 用户询问有哪些数据文件可用
+        - 用户需要查看工作区中的输出或中间结果
+        - Agent 在决策前需要确认某文件是否存在
+        """
+        ws = get_active_workspace()
+        if ws is None:
+            return "错误：当前未设置工作区。请先使用 /select-workspace 指令选择工作区目录。"
+        target = ws.resolve_within(directory)
+        if target is None:
+            return "错误：不允许访问工作区之外的路径。"
+        return list_files(target)
+
+    return [switch_mode, switch_data_version, list_data_versions, list_workspace_files]

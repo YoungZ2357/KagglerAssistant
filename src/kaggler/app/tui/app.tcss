@@ -185,3 +185,44 @@ DirectoryTree#db-tree {
     height: auto;
     margin-top: 1;
 }
+
+/* ── 对话列表弹窗 ── */
+
+ConversationListScreen {
+    align: center middle;
+}
+
+#conv-dialog {
+    width: 80;
+    height: 30;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#conv-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+ListView#conv-list {
+    height: 1fr;
+    border: round $panel;
+}
+
+#conv-rename {
+    margin-top: 1;
+}
+
+#conv-rename.hidden {
+    display: none;
+}
+
+#conv-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#conv-buttons Button {
+    margin-right: 1;
+}

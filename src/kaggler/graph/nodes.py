@@ -44,9 +44,16 @@ def react_node(
     system_text = prompt_templates[mode].replace("{schema}", schema)
 
     # (a) 注入对话摘要：summarize 节点删除的旧历史经此回注 react，否则压缩=信息净丢失。
+    # 摘要仅对 Agent 可见——Agent 应在回复中自然体现对上下文的了解（如引用之前的分析结论），
+    # 但除非被明确问到，不应向用户逐字复述摘要内容。
     summary = state.get("summary", "")
     if summary:
-        system_text += f"\n\n[对话历史摘要]\n{summary}"
+        system_text += (
+            f"\n\n[Agent对之前对话的已知信息]\n"
+            f"以下是你与用户之前对话的压缩摘要。你应当基于此理解上下文、"
+            f"延续之前的分析，但不要向用户逐字复述这些内容，"
+            f"除非用户明确要求你回顾之前的操作：\n{summary}"
+        )
 
     # (b) 显式声明当前可调用工具集：切模式后绑定集已变，但历史/摘要里仍残留旧模式的
     # tool_calls 与结果，模型可能据此误调未绑定的工具。每 turn 现填当前工具名以正视听。

@@ -81,7 +81,7 @@ class TestReactNode:
             common_tools=[],
         )
         content = fake_llm.invoked_with[0].content
-        assert "对话历史摘要" in content
+        assert "Agent对之前对话的已知信息" in content
         assert "历史要点摘要" in content
 
     def test_no_summary_block_when_absent(self, fake_llm):
@@ -93,7 +93,7 @@ class TestReactNode:
             prompt_templates={Mode.EDA: "{schema}"},
             common_tools=[],
         )
-        assert "对话历史摘要" not in fake_llm.invoked_with[0].content
+        assert "Agent对之前对话的已知信息" not in fake_llm.invoked_with[0].content
 
     def test_available_tools_declared_in_prompt(self, fake_llm):
         # (b) 当前可调用工具（common + 当前模式）显式写入提示词

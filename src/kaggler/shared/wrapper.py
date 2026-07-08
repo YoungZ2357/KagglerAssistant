@@ -10,10 +10,11 @@
 会话记忆由编译图的 checkpointer 按 ``thread_id`` 持久化，故仅首轮注入种子 state
 （current_mode / file_path / data_version），后续仅传新问题——与 cli.py 同源。
 """
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
@@ -22,14 +23,26 @@ from kaggler.persistence.data_provider import DataProvider
 
 
 class AgentSession:
-    """单数据集、多轮对话的会话句柄。线程安全性由调用方保证（TUI 在单 worker 串行调用）。"""
+    """单数据集、多轮对话的会话句柄。线程安全性由调用方保证（TUI 在单 worker 串行调用）。
 
-    def __init__(self, csv_path: str) -> None:
+    支持两种构造模式：
+    - **新建对话**：不传 ``thread_id``，内部自动生成。
+    - **恢复对话**：传入既有 ``thread_id``，由 SqliteSaver 按 thread 恢复状态。
+      ``checkpointer`` 参数允许调用方显式指定持久化后端。
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        *,
+        thread_id: Optional[str] = None,
+        checkpointer: Optional[BaseCheckpointSaver] = None,
+    ) -> None:
         self._csv_path = csv_path
         data = DataProvider()
         data.load_initial(csv_path)
-        self._graph = build_graph(data)
-        self._config = {"configurable": {"thread_id": uuid4().hex}}
+        self._graph = build_graph(data, checkpointer=checkpointer)
+        self._config = {"configurable": {"thread_id": thread_id or uuid4().hex}}
         self._seeded = False
 
     def _seed_payload(self, question: str) -> dict:

@@ -49,6 +49,15 @@ def checkpoint_db() -> Path:
     return root() / "checkpoints.sqlite"
 
 
+def conversation_db() -> Path:
+    """ConversationStore 的对话元数据数据库文件路径。
+
+    存储对话名称、thread_id、工作区路径等应用层元数据，与 checkpoint_db
+    分离——checkpoint 的 schema 由 SqliteSaver 管理，不可混入应用层表。
+    """
+    return root() / "conversations.sqlite"
+
+
 def ensure_layout() -> Path:
     """在启动时显式建好 root 目录，返回 root。
 

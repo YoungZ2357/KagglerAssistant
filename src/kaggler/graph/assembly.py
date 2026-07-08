@@ -1,3 +1,4 @@
+import sqlite3
 from functools import partial
 from pathlib import Path
 
@@ -5,6 +6,7 @@ from dotenv import load_dotenv
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
@@ -16,8 +18,20 @@ from kaggler.graph.types import Node
 from kaggler.modes.common.tools import make_tools as make_common_tools
 from kaggler.modes.registry import REGISTRY
 from kaggler.shared.config import GraphConfig, make_llm_raw, DeepSeekModel
+from kaggler.shared.paths import checkpoint_db
 from kaggler.shared.types import Mode
 from kaggler.persistence.data_provider import DataProvider
+
+
+def make_sqlite_saver(db_path: Path) -> SqliteSaver:
+    """从路径创建 SqliteSaver，自动建目录并启用 WAL 模式。
+
+    在 composition root（SessionManager）处调用，把 Path 值本身传入。
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    return SqliteSaver(conn)
 
 
 def build_graph(
@@ -83,4 +97,4 @@ def build_graph(
     builder.add_edge(Node.TOOLS, Node.REACT)
     builder.add_edge(Node.FINISH, END)
 
-    return builder.compile(checkpointer=checkpointer or MemorySaver())
+    return builder.compile(checkpointer=checkpointer or make_sqlite_saver(checkpoint_db()))

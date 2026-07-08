@@ -13,6 +13,7 @@ dependencies = [
     "langchain-core",
     "langgraph",
     "langchain-deepseek",
+    "langgraph-checkpoint-sqlite",
     # Data Processing
     "polars",
     "polars_ds",

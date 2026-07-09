@@ -22,13 +22,40 @@ def _take_latest(current, update):
     """
     return update
 
+def _merge_todos(current: list[dict] | None, update: list[dict] | None) -> list[dict]:
+    """按 id upsert 合并待办列表。
+
+    - update 中 id 缺省（None）的项视为新建，由 reducer 依据 ``max(existing)+1`` 分配 id；
+      同一 super-step 内多次 add 也不会撞号——LangGraph 对同一通道的多次写入逐条 fold，
+      每次 fold 都基于最新的 current 重算下一个 id。
+    - update 中带已知 id 的项与既有项合并字段（如 status → done）；id 未知则按新建插入。
+
+    这样容忍 LLM 一轮内多次调用待办工具（与 switch_mode 多写同源的问题）。
+    """
+    by_id: dict[int, dict] = {t["id"]: dict(t) for t in (current or [])}
+    next_id = (max(by_id) + 1) if by_id else 1
+    for u in (update or []):
+        tid = u.get("id")
+        if tid is None:
+            tid = next_id
+            next_id += 1
+            by_id[tid] = {**u, "id": tid}
+        elif tid in by_id:
+            by_id[tid].update(u)
+        else:
+            by_id[tid] = {**u, "id": tid}
+    return list(by_id.values())
+
 class CommonState(MessagesState):
     current_mode: Annotated[Mode, _take_latest]
     file_path: str
     explored_schema: str
     turn: Annotated[int, _add_turns]
-    summary: str
+    # 结构化即时记忆（AgentMemory.to_dict()）：用户目标粘性锚定、关键发现累积、进展滚动压缩。
+    memory: Annotated[dict, _take_latest]
     data_version: Annotated[int, _take_latest]
+    # 待办挂起列表：{"id": int, "content": str, "status": "open"|"done"}。永不进摘要压缩。
+    todos: Annotated[list[dict], _merge_todos]
     # 最近一次 react invoke 的上下文 token 分类拆分（含校准系数），供 TUI 可视化。
     context_usage: Annotated[dict, _take_latest]
 

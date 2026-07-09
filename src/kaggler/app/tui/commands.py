@@ -47,6 +47,10 @@ COMMANDS: dict[str, CommandSpec] = {
         name="ls",
         description="列出当前工作区文件",
     ),
+    "export": CommandSpec(
+        name="export",
+        description="导出数据版本到文件：/export [版本号] [路径]",
+    ),
     "conversations": CommandSpec(
         name="conversations",
         description="列出 / 恢复 / 重命名 / 删除对话",

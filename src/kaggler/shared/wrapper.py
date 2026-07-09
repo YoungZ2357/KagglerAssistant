@@ -10,6 +10,7 @@
 会话记忆由编译图的 checkpointer 按 ``thread_id`` 持久化，故仅首轮注入种子 state
 （current_mode / file_path / data_version），后续仅传新问题——与 cli.py 同源。
 """
+from pathlib import Path
 from typing import Any, Iterator, Optional
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
 from kaggler.shared.types import Mode
+from kaggler.persistence.data_export import ExportResult, export_and_record
 from kaggler.persistence.data_provider import DataProvider
 
 
@@ -41,6 +43,7 @@ class AgentSession:
         self._csv_path = csv_path
         data = DataProvider()
         data.load_initial(csv_path)
+        self._data = data  # 供 /export 指令通道直达版本存储（工具通道走图内闭包）
         self._graph = build_graph(data, checkpointer=checkpointer)
         self._config = {"configurable": {"thread_id": thread_id or uuid4().hex}}
         self._seeded = False
@@ -62,7 +65,7 @@ class AgentSession:
 
         只回放「用户提问」与「助手有正文的回复」两类，跳过 ToolMessage、system 与
         仅含 tool_calls 的空 AIMessage。**局限**：被 summarize 节点压缩掉的更早历史
-        已从 messages 移除（仅存于 summary），故此处只能回放最近一段幸存的消息。
+        已从 messages 移除（仅存于结构化记忆 memory），故此处只能回放最近一段幸存的消息。
         """
         state = self._graph.get_state(self._config)
         out: list[dict[str, str]] = []
@@ -72,6 +75,39 @@ class AgentSession:
             elif isinstance(m, AIMessage) and m.content:
                 out.append({"role": "assistant", "content": str(m.content)})
         return out
+
+    @property
+    def thread_id(self) -> str:
+        return self._config["configurable"]["thread_id"]
+
+    @property
+    def current_data_version(self) -> int:
+        """当前工作数据版本;未播种/无 state 时回退到 0(load_initial 产生的 root)。"""
+        return self._graph.get_state(self._config).values.get("data_version", 0)
+
+    def export_data_version(
+        self,
+        version: int | None,
+        target: Path,
+        fmt: str | None = None,
+        *,
+        db_path: Path | None = None,
+        description: str | None = None,
+    ) -> ExportResult:
+        """确定性导出(Channel A):把指定版本落盘到 target,并(若给 db_path)登记导出目录。
+
+        version 为 None 时导出当前版本;description 缺省取该版本的谱系描述。
+        供 TUI 的 /export 指令调用——指令通道有 AgentSession 句柄但够不到图内的 DataProvider,
+        故在此暴露一个直达导出入口。
+        """
+        v = version if version is not None else self.current_data_version
+        desc = description if description is not None else self._data.get_version_info(v).description
+        return export_and_record(
+            self._data, v, target, fmt,
+            db_path=db_path,
+            thread_id=self.thread_id,
+            description=desc,
+        )
 
     def set_mode(self, mode: Mode) -> None:
         """确定性切换模式（Channel A）：不经 LLM，直接写入图 state。

@@ -51,6 +51,7 @@ from kaggler.app.tui.screens import (
 )
 from kaggler.app.tui.widgets import ChatMessage, ContextMeter, TraceLine, TraceTable
 from kaggler.modes.common.compute import list_files
+from kaggler.persistence.data_export import EXPORT_SUBDIR
 from kaggler.shared.session_manager import SessionManager
 from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
@@ -368,6 +369,8 @@ class KagglerTUI(App[None]):
             self._cmd_select_workspace()
         elif name == "ls":
             self._cmd_ls(args)
+        elif name == "export":
+            self._cmd_export(args)
         elif name == "conversations":
             self._cmd_conversations()
         elif name == "exit":
@@ -423,6 +426,49 @@ class KagglerTUI(App[None]):
         except Exception as exc:
             output = f"列出文件失败：{exc}"
         self._add_message("system", output, markdown=True)
+
+    def _cmd_export(self, args: list[str]) -> None:
+        if self._session is None:
+            self._system_msg("尚未加载数据集，请先用 /load-file 加载后再导出。")
+            return
+        ws = get_active_workspace()
+        if ws is None:
+            self._system_msg("未设置工作区，请先用 /select-workspace 选择工作区目录。")
+            return
+        # 解析 /export [版本号] [路径]：首个纯数字 arg 视作版本号，其余视作路径。
+        version: int | None = None
+        path_arg: str | None = None
+        for a in args:
+            if version is None and path_arg is None and a.isdigit():
+                version = int(a)
+            else:
+                path_arg = a
+        v = version if version is not None else self._session.current_data_version
+        # 路径规则(受控目录默认 + 可选外部)：缺省 → 受控目录下 version_{v}.csv；
+        # 绝对路径 → 原样落盘(允许工作区外)；相对路径 → 受控目录内。
+        if path_arg is None:
+            target = ws.resolve_within(f"{EXPORT_SUBDIR}/version_{v}.csv")
+        elif Path(path_arg).is_absolute():
+            target = Path(path_arg)
+        else:
+            target = ws.resolve_within(f"{EXPORT_SUBDIR}/{path_arg}")
+        if target is None:
+            self._system_msg("不允许导出到工作区之外的相对路径（如需外部导出请给绝对路径）。")
+            return
+        db_path = (
+            self._session_manager.workspace.data_version_db
+            if self._session_manager is not None
+            else None
+        )
+        try:
+            result = self._session.export_data_version(version, target, db_path=db_path)
+        except (RuntimeError, ValueError, OSError) as exc:
+            self._system_msg(f"导出失败：{exc}")
+            return
+        self._system_msg(
+            f"已导出版本 {result.version} 到 {result.path}"
+            f"（{result.rows} 行 × {result.cols} 列，{result.format}）"
+        )
 
     def _cmd_conversations(self) -> None:
         if self._session_manager is None:

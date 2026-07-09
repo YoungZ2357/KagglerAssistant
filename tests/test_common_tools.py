@@ -5,6 +5,7 @@ import pytest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+import kaggler.workspace.manager as wsm
 from kaggler.modes.common.tools import make_tools
 from kaggler.persistence.data_provider import DataProvider
 from kaggler.shared.types import Mode
@@ -36,12 +37,13 @@ def _by_name(tools):
 
 
 class TestMakeCommonTools:
-    def test_returns_four_tools(self, data):
+    def test_returns_all_common_tools(self, data):
         tools = make_tools(data)
-        assert len(tools) == 4
+        assert len(tools) == 7
         assert {t.name for t in tools} == {
             "switch_mode", "switch_data_version", "list_data_versions",
-            "list_workspace_files",
+            "list_workspace_files", "export_data_version",
+            "add_todo", "complete_todo",
         }
 
     def test_tool_has_docstring(self, data):
@@ -129,3 +131,132 @@ class TestListDataVersions:
         empty_data = DataProvider()
         tool = _by_name(make_tools(empty_data))["list_data_versions"]
         assert json.loads(tool.func()) == []
+
+
+class TestTodoTools:
+    def test_add_todo_returns_command_without_id(self, data):
+        # add_todo 只提交 content + status，不带 id——id 由 _merge_todos reducer 分配
+        add_todo = _by_name(make_tools(data))["add_todo"]
+        cmd = add_todo.func(content="稍后做特征缩放", tool_call_id="tc1")
+        assert isinstance(cmd, Command)
+        todos = cmd.update["todos"]
+        assert todos == [{"content": "稍后做特征缩放", "status": "open"}]
+        assert "id" not in todos[0]
+
+    def test_add_todo_emits_tool_message(self, data):
+        add_todo = _by_name(make_tools(data))["add_todo"]
+        cmd = add_todo.func(content="记得导出结果", tool_call_id="tc-add")
+        msg = cmd.update["messages"][0]
+        assert isinstance(msg, ToolMessage)
+        assert msg.tool_call_id == "tc-add"
+        payload = json.loads(msg.content)
+        assert payload["added_todo"] == "记得导出结果"
+
+    def test_complete_todo_marks_done(self, data):
+        complete_todo = _by_name(make_tools(data))["complete_todo"]
+        state = {"todos": [{"id": 3, "content": "缩放", "status": "open"}]}
+        cmd = complete_todo.func(todo_id=3, tool_call_id="tc2", state=state)
+        assert isinstance(cmd, Command)
+        assert cmd.update["todos"] == [{"id": 3, "status": "done"}]
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert payload["completed_todo"] == 3
+        assert payload["content"] == "缩放"
+
+    def test_complete_todo_unknown_id_returns_error(self, data):
+        complete_todo = _by_name(make_tools(data))["complete_todo"]
+        state = {"todos": [{"id": 1, "content": "x", "status": "open"}]}
+        cmd = complete_todo.func(todo_id=99, tool_call_id="tc3", state=state)
+        assert "todos" not in cmd.update
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert "error" in payload
+        assert "99" in payload["error"]
+
+    def test_complete_todo_empty_state_returns_error(self, data):
+        complete_todo = _by_name(make_tools(data))["complete_todo"]
+        cmd = complete_todo.func(todo_id=1, tool_call_id="tc4", state={})
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert "error" in payload
+
+
+@pytest.fixture
+def active_ws(tmp_path, monkeypatch):
+    """设置一个临时活跃工作区(已建 .kaggler 布局);避免污染真实 ~/.kaggler。"""
+    ws = wsm.Workspace(tmp_path)
+    ws.ensure_layout()
+    monkeypatch.setattr(wsm, "_active", ws)
+    return ws
+
+
+class TestExportDataVersion:
+    _CFG = {"configurable": {"thread_id": "t-export"}}
+
+    def test_export_current_version_success(self, data, active_ws):
+        tool = _by_name(make_tools(data))["export_data_version"]
+        out = tool.func(
+            filename="out.csv", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG,
+        )
+        payload = json.loads(out)
+        assert payload["exported_version"] == 0
+        assert payload["format"] == "csv"
+        assert payload["rows"] == 3
+        target = active_ws.path / "exports" / "out.csv"
+        assert target.exists()
+        assert pl.read_csv(target)["a"].to_list() == [1, 2, 3]
+
+    def test_export_records_catalog_row(self, data, active_ws):
+        from kaggler.persistence.data_version_store import DataVersionStore
+
+        tool = _by_name(make_tools(data))["export_data_version"]
+        tool.func(
+            filename="out.csv", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG,
+        )
+        store = DataVersionStore(active_ws.data_version_db)
+        try:
+            rows = store.list_all()
+        finally:
+            store.close()
+        assert len(rows) == 1
+        assert rows[0].version == 0
+        assert rows[0].thread_id == "t-export"
+        assert rows[0].format == "csv"
+
+    def test_export_no_workspace_returns_error(self, data, monkeypatch):
+        monkeypatch.setattr(wsm, "_active", None)
+        tool = _by_name(make_tools(data))["export_data_version"]
+        out = tool.func(
+            filename="out.csv", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG,
+        )
+        assert "未设置工作区" in out
+
+    def test_export_escape_path_returns_error(self, data, active_ws):
+        # 足够多的 ../ 逃出工作区根 -> resolve_within 拒绝(安全边界是工作区，非 exports 子目录)。
+        tool = _by_name(make_tools(data))["export_data_version"]
+        out = tool.func(
+            filename="../../../evil.csv", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG,
+        )
+        assert "工作区之外" in out
+
+    def test_export_nonexistent_version_returns_error(self, data, active_ws):
+        tool = _by_name(make_tools(data))["export_data_version"]
+        out = tool.func(
+            filename="out.csv", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG, version=99,
+        )
+        payload = json.loads(out)
+        assert "error" in payload
+        assert "不存在" in payload["error"]
+
+    def test_export_parquet_by_suffix(self, data, active_ws):
+        tool = _by_name(make_tools(data))["export_data_version"]
+        out = tool.func(
+            filename="out.parquet", tool_call_id="tc", state={"data_version": 0},
+            config=self._CFG,
+        )
+        payload = json.loads(out)
+        assert payload["format"] == "parquet"
+        target = active_ws.path / "exports" / "out.parquet"
+        assert pl.read_parquet(target)["a"].to_list() == [1, 2, 3]

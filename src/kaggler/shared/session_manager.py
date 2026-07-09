@@ -125,8 +125,8 @@ class SessionManager:
     def resume_conversation(self, thread_id: str) -> AgentSession:
         """恢复已有对话，返回 AgentSession。
 
-        由 SqliteSaver 按 thread_id 恢复完整 state（messages、summary 等），
-        Agent 重启时自动获得对话历史的感知（通过 summary 字段注入 system prompt）。
+        由 SqliteSaver 按 thread_id 恢复完整 state（messages、memory、todos 等），
+        Agent 重启时自动获得对话历史的感知（通过结构化记忆 memory 与待办 todos 注入 system prompt）。
         """
         record = self._store.get_by_thread_id(thread_id)
         if record is None:

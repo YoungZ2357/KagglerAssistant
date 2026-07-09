@@ -15,6 +15,7 @@ from pathlib import Path
 _KAGGLER_DIR = ".kaggler"
 _CHECKPOINT_DB = "checkpoints.sqlite"
 _CONVERSATION_DB = "conversations.sqlite"
+_DATA_VERSION_DB = "data_versions.sqlite"
 
 # 用户级状态（跨工作区、跨会话），记录最近一次使用的工作区路径。
 _USER_STATE_DIR = Path.home() / ".kaggler"
@@ -41,6 +42,10 @@ class Workspace:
     @property
     def conversation_db(self) -> Path:
         return self._kaggler / _CONVERSATION_DB
+
+    @property
+    def data_version_db(self) -> Path:
+        return self._kaggler / _DATA_VERSION_DB
 
     def ensure_layout(self) -> Path:
         self._kaggler.mkdir(parents=True, exist_ok=True)

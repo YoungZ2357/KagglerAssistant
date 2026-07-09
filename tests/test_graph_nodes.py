@@ -71,10 +71,10 @@ class TestReactNode:
         )
         assert fake_llm.invoked_with[0].content.startswith("[]")
 
-    def test_summary_injected_when_present(self, fake_llm):
-        # (a) state 里有 summary → 回注进系统提示词
+    def test_memory_injected_when_present(self, fake_llm):
+        # (a) state 里有结构化记忆 → 分区渲染后回注进系统提示词
         react_node(
-            self._state(summary="历史要点摘要"),
+            self._state(memory={"user_goal": "预测房价", "progress": "历史要点摘要"}),
             llm=fake_llm,
             tools_by_mode={Mode.EDA: [_eda_tool]},
             prompt_templates={Mode.EDA: "{schema}"},
@@ -82,10 +82,11 @@ class TestReactNode:
         )
         content = fake_llm.invoked_with[0].content
         assert "Agent对之前对话的已知信息" in content
+        assert "预测房价" in content
         assert "历史要点摘要" in content
 
-    def test_no_summary_block_when_absent(self, fake_llm):
-        # 无 summary → 不出现摘要块
+    def test_no_memory_block_when_absent(self, fake_llm):
+        # 无记忆 → 不出现记忆块
         react_node(
             self._state(),
             llm=fake_llm,
@@ -94,6 +95,34 @@ class TestReactNode:
             common_tools=[],
         )
         assert "Agent对之前对话的已知信息" not in fake_llm.invoked_with[0].content
+
+    def test_open_todos_injected(self, fake_llm):
+        # (c) 未完成待办逐字注入，已完成的不出现
+        react_node(
+            self._state(todos=[
+                {"id": 1, "content": "做特征缩放", "status": "open"},
+                {"id": 2, "content": "已完成项", "status": "done"},
+            ]),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "{schema}"},
+            common_tools=[],
+        )
+        content = fake_llm.invoked_with[0].content
+        assert "待办管理" in content
+        assert "[#1] 做特征缩放" in content
+        assert "已完成项" not in content
+
+    def test_todo_guidance_always_present(self, fake_llm):
+        # 即使无待办，仍附「用 add_todo 登记」的轻量指引
+        react_node(
+            self._state(),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "{schema}"},
+            common_tools=[],
+        )
+        assert "add_todo" in fake_llm.invoked_with[0].content
 
     def test_available_tools_declared_in_prompt(self, fake_llm):
         # (b) 当前可调用工具（common + 当前模式）显式写入提示词
@@ -159,7 +188,7 @@ class TestReactNode:
         )
         llm = make_fake_llm(resp)
         out = react_node(
-            self._state(summary="较长的中文摘要内容片段" * 20),
+            self._state(memory={"progress": "较长的中文摘要内容片段" * 20}),
             llm=llm,
             tools_by_mode={Mode.EDA: [_eda_tool]},
             prompt_templates={Mode.EDA: "模板 {schema}"},
@@ -219,37 +248,79 @@ class TestSummaryCutoff:
 
 
 class TestSummarizeConversation:
-    def test_writes_summary_content(self, make_fake_llm):
-        llm = make_fake_llm(AIMessage(content="新摘要"))
+    def test_parses_json_into_structured_memory(self, make_fake_llm):
+        llm = make_fake_llm(AIMessage(
+            content='{"用户目标": "预测房价", "关键发现": ["f1"], "进展": "p1"}'
+        ))
         state = {"messages": [HumanMessage(content="q", id="h1")]}
         out = summarize_conversation(
             state, llm=llm, graph_config=GraphConfig(summary_keep_recent=4)
         )
-        assert out["summary"] == "新摘要"
+        assert out["memory"] == {
+            "user_goal": "预测房价", "key_findings": ["f1"], "progress": "p1",
+        }
+
+    def test_unparseable_output_falls_back_to_progress(self, make_fake_llm):
+        # 非 JSON 输出 → 回退：并入进展，不丢信息
+        llm = make_fake_llm(AIMessage(content="这不是JSON"))
+        state = {"messages": [HumanMessage(content="q", id="h1")]}
+        out = summarize_conversation(
+            state, llm=llm, graph_config=GraphConfig(summary_keep_recent=4)
+        )
+        assert out["memory"]["progress"] == "这不是JSON"
+
+    def test_sticky_user_goal_preserved_on_merge(self, make_fake_llm):
+        # 模型未给出新目标 → 沿用既有目标（锚定不漂移）
+        llm = make_fake_llm(AIMessage(
+            content='{"用户目标": "", "关键发现": ["新发现"], "进展": "新进展"}'
+        ))
+        state = {
+            "messages": [HumanMessage(content="q", id="h1")],
+            "memory": {"user_goal": "原目标", "key_findings": [], "progress": ""},
+        }
+        out = summarize_conversation(
+            state, llm=llm, graph_config=GraphConfig(summary_keep_recent=4)
+        )
+        assert out["memory"]["user_goal"] == "原目标"
+        assert out["memory"]["key_findings"] == ["新发现"]
+
+    def test_key_findings_accumulate_and_dedup(self, make_fake_llm):
+        llm = make_fake_llm(AIMessage(
+            content='{"用户目标": "g", "关键发现": ["a", "b"], "进展": "p"}'
+        ))
+        state = {
+            "messages": [HumanMessage(content="q", id="h1")],
+            "memory": {"user_goal": "g", "key_findings": ["a"], "progress": ""},
+        }
+        out = summarize_conversation(
+            state, llm=llm, graph_config=GraphConfig(summary_keep_recent=4)
+        )
+        assert out["memory"]["key_findings"] == ["a", "b"]
 
     def test_initial_prompt_branch(self, fake_llm):
-        # 无 summary → 使用 INITIAL 提示词（不含「已有摘要」字样）
+        # 无记忆 → 使用 INITIAL 提示词（不含合并标记，占位符已消解）
         state = {"messages": [HumanMessage(content="q", id="h1")]}
         summarize_conversation(
             state, llm=fake_llm, graph_config=GraphConfig(summary_keep_recent=4)
         )
         prompt = fake_llm.invoked_with[-1].content
-        assert "已有摘要" not in prompt
-        assert "{template}" not in prompt  # 占位符已被替换
+        assert "已有的结构化记忆" not in prompt
+        assert "{prev}" not in prompt
+        assert "用户目标" in prompt  # 结构化 JSON 模式说明
 
     def test_merge_prompt_branch(self, fake_llm):
-        # 有 summary → 使用 MERGE 提示词，旧摘要被注入
+        # 有记忆 → 使用 MERGE 提示词，既有记忆 JSON 被注入
         state = {
             "messages": [HumanMessage(content="q", id="h1")],
-            "summary": "旧的摘要内容",
+            "memory": {"user_goal": "旧目标", "key_findings": [], "progress": "旧的进展内容"},
         }
         summarize_conversation(
             state, llm=fake_llm, graph_config=GraphConfig(summary_keep_recent=4)
         )
         prompt = fake_llm.invoked_with[-1].content
-        assert "已有摘要" in prompt
-        assert "旧的摘要内容" in prompt
-        assert "{summary}" not in prompt
+        assert "已有的结构化记忆" in prompt
+        assert "旧的进展内容" in prompt
+        assert "{prev}" not in prompt
 
     def test_no_deletion_when_within_keep(self, fake_llm):
         # HumanMessage 数量未超过 keep → 不删除任何消息

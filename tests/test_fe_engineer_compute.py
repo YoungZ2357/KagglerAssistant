@@ -185,6 +185,101 @@ class TestExecuteEmptyValue:
         ])
         assert result["op"](df.lazy()).collect().height == 1
 
+    def test_add_indicator_creates_column_and_fills(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0, None]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "avg", "add_indicator": True}]
+        )
+        assert "error" not in result
+        out = result["op"](df.lazy()).collect()
+        # 原列已被填充（均值 2.0），无空值
+        assert out["a"].null_count() == 0
+        assert out["a"].to_list() == [1.0, 2.0, 3.0, 2.0]
+        # 标识列反映“填充前”的缺失位置
+        assert "a_is_missing" in out.columns
+        assert out["a_is_missing"].to_list() == [0, 1, 0, 1]
+
+    def test_add_indicator_reflects_pre_fill_state_with_zero(self):
+        df = pl.DataFrame({"a": [None, 5.0, None]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "zero", "add_indicator": True}]
+        )
+        out = result["op"](df.lazy()).collect()
+        assert out["a"].to_list() == [0.0, 5.0, 0.0]
+        assert out["a_is_missing"].to_list() == [1, 0, 1]
+
+    def test_add_indicator_summary_reports(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "avg", "add_indicator": True}]
+        )
+        assert any(
+            s.get("action") == "add_indicator"
+            and s.get("indicator_column") == "a_is_missing"
+            and s.get("nulls_flagged") == 1
+            for s in result["summary"]
+        )
+
+    def test_add_indicator_skipped_on_delete(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "delete", "add_indicator": True}]
+        )
+        assert "error" not in result
+        out = result["op"](df.lazy()).collect()
+        assert "a_is_missing" not in out.columns
+        assert any(
+            "delete" in w
+            for s in result["summary"]
+            for w in s.get("warnings", [])
+        )
+
+    def test_add_indicator_skipped_when_no_nulls(self):
+        df = pl.DataFrame({"a": [1.0, 2.0, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "avg", "add_indicator": True}]
+        )
+        assert "error" not in result
+        out = result["op"](df.lazy()).collect()
+        assert "a_is_missing" not in out.columns
+        assert any(
+            "无缺失" in w
+            for s in result["summary"]
+            for w in s.get("warnings", [])
+        )
+
+    def test_add_indicator_name_conflict_errors(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0], "a_is_missing": [0, 0, 0]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "avg", "add_indicator": True}]
+        )
+        assert "error" in result
+
+    def test_add_indicator_mixed_pairs_independent(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0], "b": [None, 5.0, 6.0]})
+        result = execute_empty_value(df, [
+            {"column": "a", "action": "avg", "add_indicator": True},
+            {"column": "b", "action": "zero"},
+        ])
+        out = result["op"](df.lazy()).collect()
+        assert "a_is_missing" in out.columns
+        assert "b_is_missing" not in out.columns
+        assert out["a"].null_count() == 0
+        assert out["b"].to_list() == [0.0, 5.0, 6.0]
+
+    def test_add_indicator_code_fragment_replays(self):
+        df = pl.DataFrame({"a": [1.0, None, 3.0, None]})
+        result = execute_empty_value(
+            df, [{"column": "a", "action": "avg", "add_indicator": True}]
+        )
+        expected = result["op"](df.lazy()).collect()
+        # 代码片段应可脱离 app 独立重放出同样结果
+        ns = {"pl": pl, "lf": df.lazy()}
+        exec(result["code"], ns)
+        replayed = ns["lf"].collect()
+        assert replayed["a_is_missing"].to_list() == expected["a_is_missing"].to_list()
+        assert replayed["a"].to_list() == expected["a"].to_list()
+
 
 class TestExecEncode:
     def test_one_hot_basic(self):

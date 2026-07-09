@@ -45,14 +45,23 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         - "mode"：用众数填充
         - "delete"：删除包含空值的行
 
+        缺失本身即信息：若某列的“是否缺失”本身可能与目标相关，请将该 pair 的
+        add_indicator 设为 true。工具会在填充前先生成缺失标识列 <列名>_is_missing
+        （1=原本缺失，0=非缺失），再执行填充，从而保留这一信号。该参数对 action=delete
+        或本身无缺失的列无效（会跳过并在 summary 中说明）。
+
         使用情景：
         - 用户指定某些列存在空值并要求处理时
         - 用户可以混合使用多种填充方法，例如某列用均值、另一列删除
         - 当你拥有足够自主权，且认为需要对数据进行相关处理
+        - 当缺失可能携带信息时，优先对相关列开启 add_indicator 再填充
         """
         df = data.get(state["data_version"])
         result = exec_empty(df, [p.model_dump(mode="json") for p in pairs])
+        _indicated = [p.column for p in pairs if p.add_indicator]
         description = "空值处理: " + "; ".join(f"{p.column}→{p.action.value}" for p in pairs)
+        if _indicated:
+            description += f"（缺失标识列: {_indicated}）"
         return commit_mutation(
             data, result, tool_call_id,
             parent_version=state["data_version"],

@@ -108,9 +108,54 @@ def exec_empty(
         if col not in nulls_before:
             nulls_before[col] = df[col].null_count()
 
+    # 缺失标识列：在填充前生成 <col>_is_missing，保留“缺失本身即信息”。
+    # 与 fill 放同一次 with_columns（下方 _op）——Polars 单次 with_columns 内所有表达式
+    # 均读原始列，故标识列天然反映填充前的缺失状态，顺序不会出错。
+    indicator_columns: list[tuple[str, str]] = []  # (源列, 标识列名)
+    indicator_skips: list[dict] = []
+    indicator_conflicts: list[dict] = []
+    _existing_names = set(columns_set)
+    _new_names: set[str] = set()
+    for pair in pairs:
+        if not pair.get("add_indicator"):
+            continue
+        col = pair["column"]
+        action = FillMethod(pair["action"])
+        indicator_name = f"{col}_is_missing"
+        if action == FillMethod.DELETE:
+            indicator_skips.append({
+                "column": col,
+                "action": "add_indicator",
+                "warnings": ["action 为 delete，缺失行将被删除，标识列无意义，已跳过"],
+            })
+            continue
+        if nulls_before[col] == 0:
+            indicator_skips.append({
+                "column": col,
+                "action": "add_indicator",
+                "warnings": ["该列无缺失值，标识列将全为 0 无信息，已跳过"],
+            })
+            continue
+        if indicator_name in _existing_names or indicator_name in _new_names:
+            indicator_conflicts.append({
+                "column": col,
+                "indicator_column": indicator_name,
+                "error": f"标识列名 '{indicator_name}' 与已有列或本批其它标识列冲突",
+            })
+            continue
+        _new_names.add(indicator_name)
+        indicator_columns.append((col, indicator_name))
+
+    if indicator_conflicts:
+        return {
+            "error": "部分缺失标识列名冲突",
+            "details": indicator_conflicts,
+            "hint": "请先用 drop_columns 移除同名列，或改用其它列名后重试。",
+        }
+
     fill_specs: list[dict] = []
     delete_columns: list[str] = []
-    skip_summary: list[dict] = []
+    skip_summary: list[dict] = list(indicator_skips)
 
     for pair in pairs:
         col = pair["column"]
@@ -162,6 +207,8 @@ def exec_empty(
 
     def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
         exprs = []
+        for src, indicator_name in indicator_columns:
+            exprs.append(pl.col(src).is_null().cast(pl.Int8).alias(indicator_name))
         for spec in fill_specs:
             col = spec["column"]
             if spec["type"] == "zero":
@@ -180,8 +227,13 @@ def exec_empty(
             )
         return lf
 
-    # 代码片段:镜像 _op —— zero/mode 值写死;mean/median 沿用惰性重算(在重放帧上等价)。
+    # 代码片段:镜像 _op —— 标识列在最前(与 fill 同一 with_columns);
+    # zero/mode 值写死;mean/median 沿用惰性重算(在重放帧上等价)。
     _fill_code: list[str] = []
+    for src, indicator_name in indicator_columns:
+        _fill_code.append(
+            f"{_col(src)}.is_null().cast(pl.Int8).alias({indicator_name!r})"
+        )
     for spec in fill_specs:
         c = spec["column"]
         if spec["type"] == "zero":
@@ -228,6 +280,15 @@ def exec_empty(
                 "rows_deleted": rows_before - rows_after,
                 "warnings": [],
             })
+
+    for src, indicator_name in indicator_columns:
+        summary.append({
+            "column": src,
+            "indicator_column": indicator_name,
+            "action": "add_indicator",
+            "nulls_flagged": nulls_before[src],
+            "warnings": [],
+        })
 
     preview, _preview_note = _build_preview(result_df)
 

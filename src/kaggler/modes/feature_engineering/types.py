@@ -84,6 +84,11 @@ class FillPair(BaseModel):
 
     column: str = Field(description="列名")
     action: FillMethod = Field(description="填充方法")
+    add_indicator: bool = Field(
+        default=False,
+        description="是否在填充前先生成缺失标识列 <列名>_is_missing（1=原本缺失，0=非缺失），"
+        "用于保留“缺失本身即信息”。仅在该列确有缺失且 action 非 delete 时生效。",
+    )
 
 
 class EncodePair(BaseModel):

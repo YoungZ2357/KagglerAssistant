@@ -49,7 +49,7 @@ COMMANDS: dict[str, CommandSpec] = {
     ),
     "export": CommandSpec(
         name="export",
-        description="导出数据版本到文件：/export [版本号] [路径]",
+        description="导出数据版本：/export [版本号] [路径]（路径给 .py 则导出可复现 Polars 管道脚本）",
     ),
     "conversations": CommandSpec(
         name="conversations",

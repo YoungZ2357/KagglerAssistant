@@ -11,7 +11,11 @@ from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from polars.testing import assert_frame_equal
 
+from kaggler.modes.feature_engineering import compute
+from kaggler.persistence.data_provider import DataProvider
+from kaggler.persistence.version_ledger_store import VersionLedgerStore
 from kaggler.shared import wrapper as wrapper_mod
 from kaggler.shared.types import Mode
 from kaggler.shared.wrapper import AgentSession
@@ -79,6 +83,74 @@ class TestSeedPayload:
         assert "file_path" not in payload
         assert "data_version" not in payload
         assert payload["messages"][0].content == "第二轮"
+
+
+def _seed_ledger(db, tid, csv):
+    """用真实 DataProvider+sink 落一个 source + 一个 standardize 版本，返回 (v1, 期望帧)。"""
+    class _Sink:
+        def record_version(self, version, **kw):
+            s = VersionLedgerStore(db)
+            try:
+                s.record(thread_id=tid, version=version, **kw)
+            finally:
+                s.close()
+
+    dp = DataProvider(sink=_Sink())
+    root = dp.load_initial(str(csv))
+    r = compute.exec_standardize(dp.get(root), ["score"])
+    v1 = dp.add_version(r["op"], parent=root, tool="standardize", description="std", code=r["code"])
+    return v1, dp.get(v1)
+
+
+class TestResumeRebuild:
+    def test_resume_rebuilds_tree_and_marks_seeded(self, mocker, tmp_path, csv_file):
+        db = tmp_path / "version_ledger.sqlite"
+        tid = "tid-resume"
+        v1, expected = _seed_ledger(db, tid, csv_file)
+
+        # 假图：get_state 汇报当前 data_version = v1（恢复点）。
+        class _FakeState:
+            values = {"data_version": v1}
+
+        graph = FakeGraph()
+        graph.get_state = lambda config: _FakeState()
+        mocker.patch.object(wrapper_mod, "build_graph", return_value=graph)
+
+        session = AgentSession(csv_file, thread_id=tid, version_ledger_db=db)
+
+        # 有账本 → 判定为恢复：seeded=True，重建出派生版本可读且逐值一致。
+        assert session._seeded is True
+        assert_frame_equal(session._data.get(v1), expected, check_dtypes=False)
+        # 关键回归：恢复后首轮 payload 不得把 data_version/current_mode 打回 0。
+        payload = session._seed_payload("继续")
+        assert "data_version" not in payload
+        assert "current_mode" not in payload
+
+    def test_fresh_session_persists_v0_and_not_seeded(self, mocker, tmp_path, csv_file):
+        db = tmp_path / "version_ledger.sqlite"
+        graph = FakeGraph()
+        mocker.patch.object(wrapper_mod, "build_graph", return_value=graph)
+
+        session = AgentSession(csv_file, thread_id="fresh", version_ledger_db=db)
+
+        assert session._seeded is False
+        rows = _ledger_rows(db, "fresh")
+        assert len(rows) == 1 and rows[0].kind == "source"
+
+    def test_no_ledger_db_stays_pure_memory(self, mocker, csv_file):
+        graph = FakeGraph()
+        mocker.patch.object(wrapper_mod, "build_graph", return_value=graph)
+        session = AgentSession(csv_file)  # 不传 version_ledger_db
+        assert session._seeded is False
+        assert session._data.get(0).height == 3  # v0 仍可用（load_initial）
+
+
+def _ledger_rows(db, tid):
+    s = VersionLedgerStore(db)
+    try:
+        return s.list_by_thread(tid)
+    finally:
+        s.close()
 
 
 class TestStreamEvents:

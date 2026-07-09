@@ -11,6 +11,7 @@ import pytest
 from langgraph.checkpoint.base import empty_checkpoint
 
 from kaggler.graph.assembly import make_sqlite_saver
+from kaggler.persistence.version_ledger_store import VersionLedgerStore
 from kaggler.shared.session_manager import SessionManager
 from kaggler.workspace import manager as ws_manager
 
@@ -75,3 +76,30 @@ class TestDeleteConversationPurgesCheckpoint:
         verify = make_sqlite_saver(mgr.workspace.checkpoint_db)
         assert verify.get_tuple(_config(thread_id)) is None
         verify.conn.close()
+
+
+class TestDeleteConversationPurgesVersionLedger:
+    def test_delete_removes_version_ledger_rows(self, tmp_path):
+        mgr = SessionManager(tmp_path)
+        thread_id = "tid-led"
+
+        mgr._store.create(
+            name="x", thread_id=thread_id, csv_path="/a.csv",
+            workspace_path=str(mgr.workspace.path),
+        )
+        ledger = VersionLedgerStore(mgr.workspace.version_ledger_db)
+        ledger.record(
+            thread_id=thread_id, version=0, parent=None, kind="source",
+            tool=None, description="原始数据集", code="pl.read_csv('a.csv')",
+        )
+        ledger.record(
+            thread_id=thread_id, version=1, parent=0, kind="derived",
+            tool="standardize", description="std", code="lf = lf",
+        )
+        ledger.close()
+
+        mgr.delete_conversation(thread_id)
+
+        verify = VersionLedgerStore(mgr.workspace.version_ledger_db)
+        assert verify.list_by_thread(thread_id) == []
+        verify.close()

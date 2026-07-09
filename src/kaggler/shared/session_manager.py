@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage
 
 from kaggler.graph.assembly import make_sqlite_saver
 from kaggler.persistence.conversation_store import ConversationRecord, ConversationStore
+from kaggler.persistence.version_ledger_store import VersionLedgerStore
 from kaggler.shared.config import DeepSeekModel, make_llm_raw
 from kaggler.shared.wrapper import AgentSession
 from kaggler.workspace.manager import (
@@ -120,7 +121,12 @@ class SessionManager:
         )
 
         saver = make_sqlite_saver(self._workspace.checkpoint_db)
-        return AgentSession(resolved_csv, thread_id=thread_id, checkpointer=saver)
+        return AgentSession(
+            resolved_csv,
+            thread_id=thread_id,
+            checkpointer=saver,
+            version_ledger_db=self._workspace.version_ledger_db,
+        )
 
     def resume_conversation(self, thread_id: str) -> AgentSession:
         """恢复已有对话，返回 AgentSession。
@@ -134,7 +140,12 @@ class SessionManager:
 
         self._store.update_timestamp(thread_id)
         saver = make_sqlite_saver(self._workspace.checkpoint_db)
-        return AgentSession(record.csv_path, thread_id=thread_id, checkpointer=saver)
+        return AgentSession(
+            record.csv_path,
+            thread_id=thread_id,
+            checkpointer=saver,
+            version_ledger_db=self._workspace.version_ledger_db,
+        )
 
     def list_conversations(self) -> list[ConversationRecord]:
         return self._store.list_all(str(self._workspace.path))
@@ -152,6 +163,12 @@ class SessionManager:
             saver.delete_thread(thread_id)
         finally:
             saver.conn.close()
+        # 一并清理该 thread 的版本账本，避免留下孤儿版本记录。
+        ledger = VersionLedgerStore(self._workspace.version_ledger_db)
+        try:
+            ledger.delete_by_thread(thread_id)
+        finally:
+            ledger.close()
         self._store.delete(thread_id)
 
     def rename_conversation(self, thread_id: str, new_name: str) -> None:

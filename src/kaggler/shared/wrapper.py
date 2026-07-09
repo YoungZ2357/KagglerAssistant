@@ -22,6 +22,54 @@ from kaggler.graph.types import Node
 from kaggler.shared.types import Mode
 from kaggler.persistence.data_export import ExportResult, export_and_record
 from kaggler.persistence.data_provider import DataProvider
+from kaggler.persistence.pipeline_replay import rebuild_into
+from kaggler.persistence.version_ledger_store import VersionLedgerStore, VersionRecord
+
+
+class _LedgerSink:
+    """DataProvider 的持久化端口实现：每次登记版本就开-写-关一次短连接。
+
+    沿用 export_and_record 里「store 短生命周期」的约定——版本写入低频（一次/工具调用），
+    无需 AgentSession 持有长连接与生命周期管理。
+    """
+
+    def __init__(self, db_path: Path, thread_id: str) -> None:
+        self._db_path = db_path
+        self._thread_id = thread_id
+
+    def record_version(
+        self,
+        version: int,
+        *,
+        parent: int | None,
+        kind: str,
+        tool: str | None,
+        description: str,
+        reproducible: bool,
+        code: str | None,
+    ) -> None:
+        store = VersionLedgerStore(self._db_path)
+        try:
+            store.record(
+                thread_id=self._thread_id,
+                version=version,
+                parent=parent,
+                kind=kind,
+                tool=tool,
+                description=description,
+                reproducible=reproducible,
+                code=code,
+            )
+        finally:
+            store.close()
+
+
+def _read_ledger(db_path: Path, thread_id: str) -> list[VersionRecord]:
+    store = VersionLedgerStore(db_path)
+    try:
+        return store.list_by_thread(thread_id)
+    finally:
+        store.close()
 
 
 class AgentSession:
@@ -39,14 +87,34 @@ class AgentSession:
         *,
         thread_id: Optional[str] = None,
         checkpointer: Optional[BaseCheckpointSaver] = None,
+        version_ledger_db: Optional[Path] = None,
     ) -> None:
         self._csv_path = csv_path
-        data = DataProvider()
-        data.load_initial(csv_path)
+        tid = thread_id or uuid4().hex
+        self._config = {"configurable": {"thread_id": tid}}
+
+        # 持久化端口：给了账本 DB 才落盘/可恢复；否则纯内存（CLI / 裸会话）。
+        sink = _LedgerSink(version_ledger_db, tid) if version_ledger_db is not None else None
+        data = DataProvider(sink=sink)
+
+        # 有账本记录即为「恢复」——此判定在 load_initial 写入之前做，故可靠。
+        records = _read_ledger(version_ledger_db, tid) if version_ledger_db is not None else []
+        if records:
+            rebuild_into(data, records, csv_path=csv_path)
+            self._seeded = True  # 用 checkpoint 里的 data_version，勿再把种子打回 0
+        else:
+            data.load_initial(csv_path)  # 全新：经 sink 落 v0
+            self._seeded = False
+
         self._data = data  # 供 /export 指令通道直达版本存储（工具通道走图内闭包）
         self._graph = build_graph(data, checkpointer=checkpointer)
-        self._config = {"configurable": {"thread_id": thread_id or uuid4().hex}}
-        self._seeded = False
+
+        if records:
+            # 把 HEAD 物化到 checkpoint 的当前版本（恢复点），使后续读取/分析即时可用。
+            try:
+                data.set_head(self.current_data_version)
+            except RuntimeError:
+                pass  # 恢复点异常缺失时不阻断会话，留待首个工具调用时报错
 
     def _seed_payload(self, question: str) -> dict:
         """构造本轮入图 payload；种子 state 仅首轮注入，其余由 checkpointer 续写。"""

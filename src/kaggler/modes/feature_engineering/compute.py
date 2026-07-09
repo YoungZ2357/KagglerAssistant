@@ -14,6 +14,13 @@ from kaggler.shared.limits import (
     cap_list,
 )
 from kaggler.shared.serialization import safe_val
+from kaggler.modes.feature_engineering.codegen import (
+    col as _col,
+    combine_expr_code,
+    fmt_scalar,
+    mono_expr_code,
+    with_columns_block,
+)
 from kaggler.modes.feature_engineering.types import (
     CombineMethod,
     ComparisonOp,
@@ -173,6 +180,26 @@ def exec_empty(
             )
         return lf
 
+    # 代码片段:镜像 _op —— zero/mode 值写死;mean/median 沿用惰性重算(在重放帧上等价)。
+    _fill_code: list[str] = []
+    for spec in fill_specs:
+        c = spec["column"]
+        if spec["type"] == "zero":
+            _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
+        elif spec["type"] == "mean":
+            _fill_code.append(f"{_col(c)}.fill_null({_col(c)}.mean())")
+        elif spec["type"] == "median":
+            _fill_code.append(f"{_col(c)}.fill_null({_col(c)}.median())")
+        elif spec["type"] == "mode":
+            _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
+    _code_lines: list[str] = []
+    if _fill_code:
+        _code_lines.append(with_columns_block(_fill_code))
+    if delete_columns:
+        _notnull = ", ".join(f"{_col(c)}.is_not_null()" for c in delete_columns)
+        _code_lines.append(f"lf = lf.filter(pl.all_horizontal([{_notnull}]))")
+    code = "\n".join(_code_lines) or "# (空值处理:无实际变换)"
+
     result_df = _op(df.lazy()).collect()
 
     summary: list[dict] = list(skip_summary)
@@ -208,6 +235,7 @@ def exec_empty(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -402,6 +430,39 @@ def exec_encode(
             lf = lf.drop(columns_to_drop)
         return lf
 
+    # 代码片段:镜像 _op —— one_hot 的取值集合、label 的完整映射均写死。
+    _enc_code: list[str] = []
+    for spec in encode_specs:
+        c = spec["column"]
+        if spec["type"] == "one_hot":
+            for v in spec["values"]:
+                name = f"{c}_{v}"
+                if spec["has_nulls"]:
+                    _enc_code.append(
+                        f"pl.when({_col(c)} == pl.lit({fmt_scalar(v)}))"
+                        ".then(pl.lit(True))"
+                        f".when({_col(c)}.is_not_null()).then(pl.lit(False))"
+                        f".otherwise(pl.lit(None)).alias({name!r})"
+                    )
+                else:
+                    _enc_code.append(
+                        f"({_col(c)} == pl.lit({fmt_scalar(v)})).alias({name!r})"
+                    )
+        elif spec["type"] == "label":
+            mapping = spec["mapping"]
+            _enc_code.append(
+                f"pl.when({_col(c)}.is_null()).then(None)"
+                f".otherwise({_col(c)}.replace_strict("
+                f"old={list(mapping.keys())!r}, new={list(mapping.values())!r}, default=None))"
+                f".cast(pl.Int64).alias({c!r})"
+            )
+    _code_lines = []
+    if _enc_code:
+        _code_lines.append(with_columns_block(_enc_code))
+    if columns_to_drop:
+        _code_lines.append(f"lf = lf.drop({columns_to_drop!r})")
+    code = "\n".join(_code_lines) or "# (编码:无实际变换)"
+
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -410,6 +471,7 @@ def exec_encode(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -457,6 +519,13 @@ def exec_standardize(
             exprs.append(((pl.col(c) - mean) / std).alias(c))
         return lf.with_columns(exprs)
 
+    # 代码片段:镜像 _op —— 拟合出的 mean/std 写死。
+    _std_code = [
+        f"(({_col(c)} - {fmt_scalar(stats[c][0])}) / {fmt_scalar(stats[c][1])}).alias({c!r})"
+        for c in columns
+    ]
+    code = with_columns_block(_std_code)
+
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -470,6 +539,7 @@ def exec_standardize(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -498,6 +568,8 @@ def exec_drop_columns(
     def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
         return lf.drop(columns)
 
+    code = f"lf = lf.drop({columns!r})"
+
     result_df = _op(df.lazy()).collect()
 
     warnings = []
@@ -521,6 +593,7 @@ def exec_drop_columns(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -680,6 +753,32 @@ def exec_filter_rows(
         else:
             return lf.filter(~combined_expr)
 
+    # 代码片段:镜像 _op —— 逐叶按 _OP_SYMBOLS(同为合法 Python 运算符)拼出条件表达式,
+    # 组内/组间用 & / | 左结合组合,末尾 fill_null(False),再按 keep/delete 决定是否取反。
+    def _leaf_code(cond: dict) -> str:
+        op = ComparisonOp(cond["op"])
+        return f"({_col(cond['column'])} {_OP_SYMBOLS[op]} {fmt_scalar(cond['value'])})"
+
+    _group_codes: list[str] = []
+    for g in groups:
+        logic = RowLogic(g["logic"])
+        conds = g["conditions"]
+        joiner = "&" if logic == RowLogic.AND else "|"
+        expr_c = _leaf_code(conds[0])
+        for cond in conds[1:]:
+            expr_c = f"({expr_c} {joiner} {_leaf_code(cond)})"
+        _group_codes.append(expr_c)
+    combined_code = _group_codes[0]
+    _group_joiner = "&" if group_logic_enum == RowLogic.AND else "|"
+    for gc in _group_codes[1:]:
+        combined_code = f"({combined_code} {_group_joiner} {gc})"
+    combined_code = f"({combined_code}).fill_null(False)"
+    code = (
+        f"lf = lf.filter({combined_code})"
+        if keep
+        else f"lf = lf.filter(~{combined_code})"
+    )
+
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -696,11 +795,32 @@ def exec_filter_rows(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
         "rows_after": result_df.height,
     }
+
+
+def _weighted_combo_code(
+    weights: list[tuple[float, list[float]]],
+    numeric_cols: list[str],
+    out_cols: list[str],
+) -> str:
+    """PCA/LDA 降维:把每个分量的 (bias, 权重向量) 转成 with_columns 源码。
+
+    镜像 _op:``pl.lit(bias) + pl.col(c)*w + …``(``*`` 先于 ``+``,与逐项累加等价),
+    仅保留非零权重项。
+    """
+    exprs: list[str] = []
+    for i, (bias_val, ws) in enumerate(weights):
+        parts = [f"pl.lit({fmt_scalar(bias_val)})"]
+        for j, c in enumerate(numeric_cols):
+            if ws[j] != 0.0:
+                parts.append(f"{_col(c)} * {fmt_scalar(ws[j])}")
+        exprs.append(f"({' + '.join(parts)}).alias({out_cols[i]!r})")
+    return exprs
 
 
 def exec_dim_reduct(
@@ -793,6 +913,12 @@ def exec_dim_reduct(
                 exprs.append(expr.alias(pc_cols[i]))
             return lf.with_columns(exprs).select(final_cols)
 
+        # 代码片段:镜像 _op —— 折叠了(可选)标准化的线性权重写死。
+        code = (
+            with_columns_block(_weighted_combo_code(weights, numeric_cols, pc_cols))
+            + f"\nlf = lf.select({final_cols!r})"
+        )
+
         result_df = _op(df.lazy()).collect()
 
         preview, _preview_note = _build_preview(result_df)
@@ -815,6 +941,7 @@ def exec_dim_reduct(
             summary.append(_preview_note)
         return {
             "op": _op,
+            "code": code,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -930,6 +1057,12 @@ def exec_dim_reduct(
                 exprs.append(expr.alias(ld_cols[i]))
             return lf.with_columns(exprs).select(final_cols)
 
+        # 代码片段:镜像 _op —— 折叠了(可选)标准化的线性判别权重写死。
+        code = (
+            with_columns_block(_weighted_combo_code(weights, numeric_cols, ld_cols))
+            + f"\nlf = lf.select({final_cols!r})"
+        )
+
         result_df = _op(df_clean.lazy()).collect()
 
         preview, _preview_note = _build_preview(result_df)
@@ -954,6 +1087,7 @@ def exec_dim_reduct(
             summary.append(_preview_note)
         return {
             "op": _op,
+            "code": code,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -1071,6 +1205,14 @@ def exec_transform_mono(
             exprs.append(expr.alias(out))
         return lf.with_columns(exprs)
 
+    # 代码片段:镜像 _op —— 各一元变换表达式经 codegen._MONO_CODE 转写,常量写死。
+    _mono_code = [
+        f"({mono_expr_code(MonoTransform(spec['method']), spec['column'], spec)})"
+        f".alias({out!r})"
+        for spec, out in zip(specs, resolved)
+    ]
+    code = with_columns_block(_mono_code)
+
     result_df = _op(df.lazy()).collect()
     summary = []
     for spec, out in zip(specs, resolved):
@@ -1099,6 +1241,7 @@ def exec_transform_mono(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -1152,6 +1295,12 @@ def exec_transform_combination(
         combined = _COMBO_EXPR[method_enum](exprs)
         return lf.with_columns(combined.alias(output_name))
 
+    # 代码片段:镜像 _op —— 组合表达式经 codegen._COMBO_CODE 转写。
+    code = (
+        f"lf = lf.with_columns(({combine_expr_code(method_enum, columns)})"
+        f".alias({output_name!r}))"
+    )
+
     result_df = _op(df.lazy()).collect()
 
     warnings = []
@@ -1174,6 +1323,7 @@ def exec_transform_combination(
         summary.append(_preview_note)
     return {
         "op": _op,
+        "code": code,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,

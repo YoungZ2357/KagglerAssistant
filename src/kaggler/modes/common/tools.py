@@ -125,17 +125,21 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             state: Annotated[dict, InjectedState],
             config: RunnableConfig,
             version: Annotated[int | None, "要导出的版本号；省略则导出当前版本"] = None,
-            fmt: Annotated[str | None, "导出格式 csv / parquet；省略则按文件名后缀推断，默认 csv"] = None,
+            fmt: Annotated[str | None, "导出格式 csv / parquet / py；省略则按文件名后缀推断，默认 csv"] = None,
     ) -> str:
-        """把某个数据版本导出（持久化）为文件，供在应用外使用（如提交、用 Excel 打开）。
+        """把某个数据版本导出（持久化）为文件，供在应用外使用（如提交、用 Excel 打开、Kaggle 脚本）。
 
         文件写入当前工作区的受控子目录 `exports/` 下（不允许写到工作区之外）。
         version 省略时导出当前正在使用的数据版本；可先用 list_data_versions 查看有哪些版本。
-        格式默认按文件名后缀推断（.csv/.parquet），也可用 fmt 显式指定；当前支持 csv 与 parquet。
+        格式默认按文件名后缀推断，也可用 fmt 显式指定，支持：
+        - csv / parquet：导出该版本的数据文件。
+        - py：导出一份可复现的 Polars 管道脚本（读原始数据→复现全部预处理步骤→写出），
+          用于备份或 Kaggle 脚本提交；拟合常量（均值/标准差、编码映射、PCA/LDA 权重）已写死。
 
         使用情景：
         - 用户要求把处理后的数据 / 某个历史版本保存 / 导出为文件
         - 需要产出可提交（submission）或可在外部工具打开的数据文件
+        - 用户想要一份能复现预处理流程的代码脚本（导出为 .py）
 
         本工具不创建新数据版本、不改变当前版本指针，仅落盘并登记一条导出记录。
         """

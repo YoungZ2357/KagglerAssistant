@@ -19,6 +19,7 @@ from kaggler.modes.feature_engineering.codegen import (
     combine_expr_code,
     fmt_scalar,
     mono_expr_code,
+    over_code,
     with_columns_block,
 )
 from kaggler.modes.feature_engineering.types import (
@@ -53,6 +54,33 @@ def _build_preview(result_df: pl.DataFrame) -> tuple[list[dict], dict | None]:
             )
         }
     return preview, note
+
+
+_STAT_ACTIONS = (FillMethod.AVG, FillMethod.MEDIAN, FillMethod.MODE)
+
+
+def _resolve_group(df: pl.DataFrame, pair: dict) -> tuple | None:
+    """把 pair 的分组意图解析为 (group_col, group_breaks, warnings)，不分组则返回 None。
+
+    - group_bins 为 None：按 group_by 原始取值直接分组（group_breaks=None）。
+    - group_bins 有值：等宽分箱，内部切点 = edges[1:-1]（镜像 eda._box_data_raw 的
+      edges = [min + i*(max-min)/bins] 公式）；常数列/全空列无法分箱，退化为直接分组并警告。
+    切点提前算好写死，保证惰性重放确定性。
+    """
+    g = pair.get("group_by")
+    if g is None:
+        return None
+    gbins = pair.get("group_bins")
+    if gbins is None:
+        return (g, None, [])
+    clean = df[g].drop_nulls()
+    if clean.len() == 0:
+        return (g, None, [f"分组列 '{g}' 全为空，无法分箱，已退化为按取值分组"])
+    gmin, gmax = float(clean.min()), float(clean.max())
+    if gmax == gmin:
+        return (g, None, [f"分组列 '{g}' 为常数，无法分箱，已退化为按取值分组"])
+    edges = [gmin + i * (gmax - gmin) / gbins for i in range(gbins + 1)]
+    return (g, edges[1:-1], [])
 
 
 def exec_empty(
@@ -90,6 +118,32 @@ def exec_empty(
                 "column": col,
                 "error": f"填充方法 '{action.value}' 仅适用于数值列，当前类型: {dtype}",
             })
+
+        # 分组填充校验：仅对统计量 action(avg/median/mode)生效；zero/delete 带 group_by
+        # 不报错，后续忽略分组并在 summary 警告。
+        group_by = pair.get("group_by")
+        if group_by is not None and action in _STAT_ACTIONS:
+            if group_by not in columns_set:
+                unknown.append(group_by)
+            elif group_by == col:
+                dtype_errors.append({
+                    "column": col,
+                    "error": "group_by 不能与被填充列相同",
+                })
+            else:
+                group_bins = pair.get("group_bins")
+                if group_bins is not None:
+                    if not schema[group_by].is_numeric():
+                        dtype_errors.append({
+                            "column": col,
+                            "error": f"group_bins 仅适用于数值分组列，"
+                            f"但 '{group_by}' 类型为 {schema[group_by]}",
+                        })
+                    elif group_bins < 2:
+                        dtype_errors.append({
+                            "column": col,
+                            "error": f"group_bins 必须 >= 2，收到 {group_bins}",
+                        })
 
     if unknown:
         return {
@@ -155,24 +209,35 @@ def exec_empty(
 
     fill_specs: list[dict] = []
     delete_columns: list[str] = []
+    delete_group_ignored: set[str] = set()  # delete 列中带了 group_by(无意义，已忽略)
     skip_summary: list[dict] = list(indicator_skips)
 
     for pair in pairs:
         col = pair["column"]
         action = FillMethod(pair["action"])
         dtype = schema[col]
+        # zero/delete 带 group_by 无意义：忽略分组并在 summary 警告。
+        group_ignored = pair.get("group_by") is not None and action not in _STAT_ACTIONS
 
         if action == FillMethod.DELETE:
             delete_columns.append(col)
+            if group_ignored:
+                delete_group_ignored.add(col)
             continue
 
         if action == FillMethod.ZERO:
+            _zero_warn = (
+                ["group_by 对 zero 填充无意义，已忽略分组"] if group_ignored else []
+            )
             if dtype.is_numeric():
-                fill_specs.append({"column": col, "type": "zero", "value": 0})
+                fill_specs.append({"column": col, "type": "zero", "value": 0,
+                                   "warnings": _zero_warn})
             elif dtype == pl.String:
-                fill_specs.append({"column": col, "type": "zero", "value": "0"})
+                fill_specs.append({"column": col, "type": "zero", "value": "0",
+                                   "warnings": _zero_warn})
             elif dtype == pl.Boolean:
-                fill_specs.append({"column": col, "type": "zero", "value": False})
+                fill_specs.append({"column": col, "type": "zero", "value": False,
+                                   "warnings": _zero_warn})
             else:
                 skip_summary.append({
                     "column": col,
@@ -183,18 +248,30 @@ def exec_empty(
                 })
             continue
 
+        # 统计量填充(avg/median/mode)：解析分组意图。
+        group = _resolve_group(df, pair)
+        group_col = group[0] if group else None
+        group_breaks = group[1] if group else None
+        group_warns = group[2] if group else []
+
         if action == FillMethod.AVG:
-            fill_specs.append({"column": col, "type": "mean"})
+            fill_specs.append({"column": col, "type": "mean",
+                               "group_col": group_col, "group_breaks": group_breaks,
+                               "warnings": group_warns})
             continue
 
         if action == FillMethod.MEDIAN:
-            fill_specs.append({"column": col, "type": "median"})
+            fill_specs.append({"column": col, "type": "median",
+                               "group_col": group_col, "group_breaks": group_breaks,
+                               "warnings": group_warns})
             continue
 
         if action == FillMethod.MODE:
             mode_val = df[col].drop_nulls().mode()
             if mode_val is not None and mode_val.len() > 0:
-                fill_specs.append({"column": col, "type": "mode", "value": mode_val[0]})
+                fill_specs.append({"column": col, "type": "mode", "value": mode_val[0],
+                                   "group_col": group_col, "group_breaks": group_breaks,
+                                   "warnings": group_warns})
             else:
                 skip_summary.append({
                     "column": col,
@@ -205,6 +282,12 @@ def exec_empty(
                 })
             continue
 
+    def _group_key(spec):
+        """分组键表达式：无切点按取值分组，有切点先等宽分箱。"""
+        g = spec["group_col"]
+        breaks = spec["group_breaks"]
+        return pl.col(g) if breaks is None else pl.col(g).cut(breaks)
+
     def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
         exprs = []
         for src, indicator_name in indicator_columns:
@@ -213,12 +296,30 @@ def exec_empty(
             col = spec["column"]
             if spec["type"] == "zero":
                 exprs.append(pl.col(col).fill_null(spec["value"]))
-            elif spec["type"] == "mean":
-                exprs.append(pl.col(col).fill_null(pl.col(col).mean()))
-            elif spec["type"] == "median":
-                exprs.append(pl.col(col).fill_null(pl.col(col).median()))
+            elif spec["type"] in ("mean", "median"):
+                stat = (
+                    pl.col(col).mean() if spec["type"] == "mean"
+                    else pl.col(col).median()
+                )
+                if spec.get("group_col"):
+                    # 组内统计量填充，组内无有效值时回退全局统计量兜底。
+                    exprs.append(
+                        pl.col(col).fill_null(stat.over(_group_key(spec)))
+                        .fill_null(stat)
+                    )
+                else:
+                    exprs.append(pl.col(col).fill_null(stat))
             elif spec["type"] == "mode":
-                exprs.append(pl.col(col).fill_null(spec["value"]))
+                if spec.get("group_col"):
+                    grouped = (
+                        pl.col(col).drop_nulls().mode().first().over(_group_key(spec))
+                    )
+                    # 组内众数缺失时回退全局众数(已 eager 算出的字面量)。
+                    exprs.append(
+                        pl.col(col).fill_null(grouped).fill_null(spec["value"])
+                    )
+                else:
+                    exprs.append(pl.col(col).fill_null(spec["value"]))
         if exprs:
             lf = lf.with_columns(exprs)
         if delete_columns:
@@ -238,12 +339,25 @@ def exec_empty(
         c = spec["column"]
         if spec["type"] == "zero":
             _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
-        elif spec["type"] == "mean":
-            _fill_code.append(f"{_col(c)}.fill_null({_col(c)}.mean())")
-        elif spec["type"] == "median":
-            _fill_code.append(f"{_col(c)}.fill_null({_col(c)}.median())")
+        elif spec["type"] in ("mean", "median"):
+            _stat_code = f"{_col(c)}.{spec['type']}()"
+            if spec.get("group_col"):
+                _grouped = over_code(_stat_code, spec["group_col"], spec["group_breaks"])
+                _fill_code.append(
+                    f"{_col(c)}.fill_null({_grouped}).fill_null({_stat_code})"
+                )
+            else:
+                _fill_code.append(f"{_col(c)}.fill_null({_stat_code})")
         elif spec["type"] == "mode":
-            _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
+            if spec.get("group_col"):
+                _mode_code = f"{_col(c)}.drop_nulls().mode().first()"
+                _grouped = over_code(_mode_code, spec["group_col"], spec["group_breaks"])
+                _fill_code.append(
+                    f"{_col(c)}.fill_null({_grouped})"
+                    f".fill_null({fmt_scalar(spec['value'])})"
+                )
+            else:
+                _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
     _code_lines: list[str] = []
     if _fill_code:
         _code_lines.append(with_columns_block(_fill_code))
@@ -261,13 +375,25 @@ def exec_empty(
         if any(s.get("column") == col for s in summary):
             continue
         nulls_after = result_df[col].null_count()
-        summary.append({
+        method = _method_names[spec["type"]]
+        if spec.get("group_col"):
+            if spec["group_breaks"] is not None:
+                method += (
+                    f" (grouped by {spec['group_col']}[{len(spec['group_breaks']) + 1} bins])"
+                )
+            else:
+                method += f" (grouped by {spec['group_col']})"
+        entry = {
             "column": col,
-            "method": _method_names[spec["type"]],
+            "method": method,
             "nulls_before": nulls_before[col],
             "nulls_filled": nulls_before[col] - nulls_after,
-            "warnings": [],
-        })
+            "warnings": list(spec.get("warnings", [])),
+        }
+        # 分组+全局兜底后仍有残余空值(如整列全空)时如实上报。
+        if nulls_after > 0:
+            entry["nulls_remaining"] = nulls_after
+        summary.append(entry)
 
     if delete_columns:
         rows_before = df.height
@@ -278,7 +404,10 @@ def exec_empty(
                 "method": "delete",
                 "nulls_before": nulls_before[col],
                 "rows_deleted": rows_before - rows_after,
-                "warnings": [],
+                "warnings": (
+                    ["group_by 对 delete 无意义，已忽略分组"]
+                    if col in delete_group_ignored else []
+                ),
             })
 
     for src, indicator_name in indicator_columns:

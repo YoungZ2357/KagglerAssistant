@@ -50,16 +50,30 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         （1=原本缺失，0=非缺失），再执行填充，从而保留这一信号。该参数对 action=delete
         或本身无缺失的列无效（会跳过并在 summary 中说明）。
 
+        分组填充：avg/median/mode 可设 group_by=<列名>，按该列分组后用组内统计量填充
+        （比全局统计量更贴合数据，如按舱位分组填年龄）。分组列为定类/字符串列时按取值
+        直接分组；为数值列时需额外设 group_bins=<箱数>（等宽分箱后按箱分组），否则按数值
+        原始取值分组（适用于已编码的低基数类别整数列）。组内无有效值时自动回退全局统计量。
+        group_by 对 zero/delete 无意义（会忽略并在 summary 说明）。
+
         使用情景：
         - 用户指定某些列存在空值并要求处理时
         - 用户可以混合使用多种填充方法，例如某列用均值、另一列删除
         - 当你拥有足够自主权，且认为需要对数据进行相关处理
         - 当缺失可能携带信息时，优先对相关列开启 add_indicator 再填充
+        - 当某列的合理取值明显依赖另一列时，优先用 group_by 分组填充
         """
         df = data.get(state["data_version"])
         result = exec_empty(df, [p.model_dump(mode="json") for p in pairs])
         _indicated = [p.column for p in pairs if p.add_indicator]
-        description = "空值处理: " + "; ".join(f"{p.column}→{p.action.value}" for p in pairs)
+
+        def _fmt(p):
+            s = f"{p.column}→{p.action.value}"
+            if p.group_by:
+                s += f"（按 {p.group_by} 分组）"
+            return s
+
+        description = "空值处理: " + "; ".join(_fmt(p) for p in pairs)
         if _indicated:
             description += f"（缺失标识列: {_indicated}）"
         return commit_mutation(

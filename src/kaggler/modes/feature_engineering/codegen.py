@@ -35,6 +35,16 @@ def with_columns_block(exprs: list[str]) -> str:
     return f"lf = lf.with_columns([\n{inner}\n])"
 
 
+def over_code(inner: str, group_col: str, breaks: list | None) -> str:
+    """把统计量表达式源码 ``inner`` 包成分组窗口 ``inner.over(key)``。
+
+    ``breaks`` 为 None 时按原始取值分组(``pl.col(g)``);否则用等宽分箱内部切点
+    ``pl.col(g).cut([...])`` 作分组键。切点原样写死,保证脱离 app 重放确定性。
+    """
+    key = col(group_col) if breaks is None else f"{col(group_col)}.cut({breaks!r})"
+    return f"{inner}.over({key})"
+
+
 # 一元变换 method -> (列引用源码, spec) -> 表达式源码。与 compute._MONO_EXPR 一一对应。
 _MONO_CODE = {
     MonoTransform.COS: lambda c, s: f"{c}.cos()",

@@ -89,6 +89,17 @@ class FillPair(BaseModel):
         description="是否在填充前先生成缺失标识列 <列名>_is_missing（1=原本缺失，0=非缺失），"
         "用于保留“缺失本身即信息”。仅在该列确有缺失且 action 非 delete 时生效。",
     )
+    group_by: str | None = Field(
+        default=None,
+        description="按该列分组后计算组内统计量再填充；仅对 avg/median/mode 生效，"
+        "对 zero/delete 忽略。定类/字符串列按取值直接分组；数值列需配合 group_bins。"
+        "组内无有效值时回退到全局统计量。",
+    )
+    group_bins: int | None = Field(
+        default=None,
+        description="仅当 group_by 为数值列时：等宽分箱数（>=2），分箱后按箱分组。"
+        "省略则按数值原始取值直接分组（适用于已编码的低基数类别整数列）。",
+    )
 
 
 class EncodePair(BaseModel):

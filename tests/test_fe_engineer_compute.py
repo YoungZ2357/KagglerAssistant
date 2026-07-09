@@ -281,6 +281,164 @@ class TestExecuteEmptyValue:
         assert replayed["a"].to_list() == expected["a"].to_list()
 
 
+class TestExecuteEmptyValueGrouped:
+    def test_grouped_avg_categorical(self):
+        df = pl.DataFrame({
+            "g": ["A", "A", "A", "B", "B", "B"],
+            "x": [10.0, 20.0, None, 100.0, 200.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g"}]
+        )
+        assert "error" not in result
+        # 组内均值：A=15, B=150（≠全局均值 82.5）
+        assert result["op"](df.lazy()).collect()["x"].to_list() == [
+            10.0, 20.0, 15.0, 100.0, 200.0, 150.0
+        ]
+
+    def test_grouped_median_categorical(self):
+        df = pl.DataFrame({
+            "g": ["A", "A", "A", "B", "B", "B"],
+            "x": [1.0, 3.0, None, 100.0, 300.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "median", "group_by": "g"}]
+        )
+        out = result["op"](df.lazy()).collect()["x"].to_list()
+        assert out[2] == 2.0 and out[5] == 200.0
+
+    def test_grouped_mode_categorical(self):
+        df = pl.DataFrame({
+            "g": ["A", "A", "A", "B", "B", "B"],
+            "x": ["p", None, "p", "q", "q", None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "mode", "group_by": "g"}]
+        )
+        assert result["op"](df.lazy()).collect()["x"].to_list() == [
+            "p", "p", "p", "q", "q", "q"
+        ]
+
+    def test_grouped_avg_numeric_binned(self):
+        df = pl.DataFrame({
+            "g": [1.0, 1.0, 10.0, 10.0],
+            "x": [10.0, None, 100.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g", "group_bins": 2}]
+        )
+        assert "error" not in result
+        # 分箱：g<=5.5 与 g>5.5；箱1均值=10，箱2均值=100（≠全局均值 55）
+        assert result["op"](df.lazy()).collect()["x"].to_list() == [
+            10.0, 10.0, 100.0, 100.0
+        ]
+
+    def test_empty_group_falls_back_to_global(self):
+        df = pl.DataFrame({
+            "g": ["A", "A", "A", "B"],
+            "x": [10.0, 20.0, 30.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g"}]
+        )
+        out = result["op"](df.lazy()).collect()
+        # B 组内全空 → 回退全局均值 20
+        assert out["x"].null_count() == 0
+        assert out["x"].to_list()[3] == 20.0
+
+    def test_all_null_reports_remaining(self):
+        df = pl.DataFrame(
+            {"g": ["A", "B"], "x": pl.Series([None, None], dtype=pl.Float64)}
+        )
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g"}]
+        )
+        out = result["op"](df.lazy()).collect()
+        assert out["x"].null_count() == 2
+        assert any(s.get("nulls_remaining") == 2 for s in result["summary"])
+
+    def test_grouped_code_fragment_replays_categorical(self):
+        df = pl.DataFrame({
+            "g": ["A", "A", "B", "B"],
+            "x": [10.0, None, 100.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g"}]
+        )
+        expected = result["op"](df.lazy()).collect()
+        assert ".over(" in result["code"]
+        ns = {"pl": pl, "lf": df.lazy()}
+        exec(result["code"], ns)
+        replayed = ns["lf"].collect()
+        assert replayed["x"].to_list() == expected["x"].to_list()
+
+    def test_grouped_code_fragment_replays_binned(self):
+        df = pl.DataFrame({
+            "g": [1.0, 1.0, 10.0, 10.0],
+            "x": [10.0, None, 100.0, None],
+        })
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g", "group_bins": 2}]
+        )
+        expected = result["op"](df.lazy()).collect()
+        assert ".cut(" in result["code"]
+        ns = {"pl": pl, "lf": df.lazy()}
+        exec(result["code"], ns)
+        replayed = ns["lf"].collect()
+        assert replayed["x"].to_list() == expected["x"].to_list()
+
+    def test_error_group_by_unknown_column(self):
+        df = pl.DataFrame({"x": [1.0, None, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "nope"}]
+        )
+        assert "error" in result
+
+    def test_error_group_by_self(self):
+        df = pl.DataFrame({"x": [1.0, None, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "x"}]
+        )
+        assert "error" in result
+
+    def test_error_group_bins_on_non_numeric(self):
+        df = pl.DataFrame({"g": ["A", "B", None], "x": [1.0, 2.0, None]})
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g", "group_bins": 3}]
+        )
+        assert "error" in result
+
+    def test_error_group_bins_too_small(self):
+        df = pl.DataFrame({"g": [1.0, 2.0, None], "x": [1.0, 2.0, None]})
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "avg", "group_by": "g", "group_bins": 1}]
+        )
+        assert "error" in result
+
+    def test_group_by_ignored_for_zero(self):
+        df = pl.DataFrame({"g": ["A", "B", "A"], "x": [1.0, None, 3.0]})
+        result = execute_empty_value(
+            df, [{"column": "x", "action": "zero", "group_by": "g"}]
+        )
+        assert "error" not in result
+        # 仍按 zero 填充，且给出忽略分组的警告
+        assert result["op"](df.lazy()).collect()["x"].to_list() == [1.0, 0.0, 3.0]
+        assert any(
+            "无意义" in w
+            for s in result["summary"]
+            for w in s.get("warnings", [])
+        )
+
+    def test_ungrouped_code_unchanged(self):
+        df = pl.DataFrame({"a": [2.0, None, 4.0]})
+        result = execute_empty_value(df, [{"column": "a", "action": "avg"}])
+        # 不传 group_by 时产出代码与分组特性无关，不应含窗口
+        assert ".over(" not in result["code"]
+        assert result["code"] == (
+            "lf = lf.with_columns([\n    pl.col('a').fill_null(pl.col('a').mean())\n])"
+        )
+
+
 class TestExecEncode:
     def test_one_hot_basic(self):
         df = pl.DataFrame({"color": ["red", "blue", "red", "green"]})

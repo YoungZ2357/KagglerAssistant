@@ -21,13 +21,21 @@ renderable 取不到可选文本**（拖选后复制为空）。而 Textual 的 
 **本轮结束**再把正文换成 ``Markdown`` 部件（格式化 + 可选）。用户/系统/错误消息正文
 始终是纯文本 ``Static``。头部标签与所有正文都可被拖选复制。
 """
+import unicodedata
 from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
-from textual.widgets import Markdown, Static
+from textual.widgets import Label, Markdown, Static
+
+from kaggler.shared.token_estimate import (
+    CONTEXT_LIMIT,
+    CONTEXT_RECOMMENDED,
+    bar_fill,
+    utilization,
+)
 
 # 角色 → 头部标签文本与样式（复用旧配色）。
 _ROLE_HEADER: dict[str, tuple[str, str]] = {
@@ -100,6 +108,93 @@ class ChatMessage(Vertical):
             self._markdown = markdown
         self.query_one(".msg-body").remove()
         self.mount(self._make_body())
+
+
+# 分类键 → 面板显示标签（顺序即渲染顺序）。
+_CATEGORY_LABELS: list[tuple[str, str]] = [
+    ("system", "系统提示词"),
+    ("summary", "对话摘要"),
+    ("tools", "工具定义"),
+    ("user", "用户消息"),
+    ("assistant", "助手消息"),
+    ("tool_results", "工具结果"),
+]
+_BAR_WIDTH = 16
+_PLACEHOLDER = Text("暂无数据（提问后统计）", style="dim")
+
+
+def _cell_width(s: str) -> int:
+    """字符串在终端的显示宽度（东亚宽/全角字符占 2 格）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in s)
+
+
+def _cell_ljust(s: str, target: int) -> str:
+    """按显示宽度左对齐补空格，使 CJK 标签列对齐。"""
+    return s + " " * max(0, target - _cell_width(s))
+
+
+class ContextMeter(Vertical):
+    """右栏「上下文占用」面板：预算进度条 + 分类明细 + 估算/实测/校准系数。
+
+    数据来自 ``wrapper.stream_events`` 的 ``{"type": "context", "usage": ...}`` 事件
+    （即 react 节点每次 invoke 产出的 :class:`ContextBreakdown` 载荷）。数值/占比等
+    走 ``token_estimate`` 的纯函数，颜色映射留在本部件。
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("上下文占用", classes="panel-title")
+        yield Static(_PLACEHOLDER, id="context-body", markup=False)
+
+    def clear(self) -> None:
+        """重建会话时复位为占位文案。"""
+        self.query_one("#context-body", Static).update(_PLACEHOLDER)
+
+    def update_usage(self, usage: dict) -> None:
+        total = usage.get("total", 0)
+        recommended = usage.get("recommended", CONTEXT_RECOMMENDED)
+        limit = usage.get("limit", CONTEXT_LIMIT)
+        cats = usage.get("categories", {})
+
+        frac = utilization(total, recommended)
+        fill = bar_fill(frac, _BAR_WIDTH)
+        if frac >= 1.0:
+            bar_style = "bold red"
+        elif frac >= 0.5:
+            bar_style = "yellow"
+        else:
+            bar_style = "green"
+
+        text = Text()
+        # 预算条
+        text.append("总 ", "dim")
+        text.append(f"{total:,}", "bold")
+        text.append("  ")
+        text.append("█" * fill, bar_style)
+        text.append("░" * (_BAR_WIDTH - fill), "dim")
+        text.append(f" {frac * 100:.0f}%\n", bar_style)
+        text.append(
+            f"推荐 {recommended // 1000}k · 上限 {limit // 1_000_000}M\n", "dim"
+        )
+        # 分类明细
+        for key, label in _CATEGORY_LABELS:
+            v = cats.get(key, 0)
+            pct = (v / total * 100) if total else 0
+            text.append(_cell_ljust(label, 12), "dim")
+            text.append(f"{v:>8,}", "cyan")
+            text.append(f" {pct:>3.0f}%\n", "dim")
+        # 校准行
+        est = usage.get("estimated_total", 0)
+        actual = usage.get("actual_total")
+        factor = usage.get("calibration_factor", 1.0)
+        text.append("估算 ", "dim")
+        text.append(f"{est:,}", "green")
+        if actual is not None:
+            text.append(" · 实测 ", "dim")
+            text.append(f"{actual:,}", "magenta")
+        text.append(" · 系数 ", "dim")
+        text.append(f"{factor:g}", "yellow")
+
+        self.query_one("#context-body", Static).update(text)
 
 
 class TraceLine(Static):

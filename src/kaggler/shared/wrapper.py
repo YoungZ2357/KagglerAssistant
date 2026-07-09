@@ -95,6 +95,8 @@ class AgentSession:
         - ``{"type": "token", "content": str}``     —— react 节点的回答文本片段
         - ``{"type": "node_done", "node": str, "tool_calls": list[dict]}``
                                                     —— 节点产出一批 state 更新
+        - ``{"type": "context", "usage": dict}``    —— react 节点的上下文 token 分类
+                                                       拆分（含校准系数），供占用面板可视化
 
         仅透出节点流转与 tool_calls（Agent 决策了什么 / 调了什么工具）；**不**透出
         tool_result 等数据呈现内容——那是另一类需求，不在追溯范围内。
@@ -129,6 +131,7 @@ class AgentSession:
                     updates = state_update if isinstance(state_update, list) else [state_update]
                     tool_calls: list[dict] = []
                     new_mode = None
+                    context_usage = None
                     for upd in updates:
                         if not isinstance(upd, dict):
                             continue
@@ -141,8 +144,13 @@ class AgentSession:
                         mode_upd = upd.get("current_mode")
                         if mode_upd is not None:
                             new_mode = mode_upd
+                        cu = upd.get("context_usage")
+                        if cu:
+                            context_usage = cu
                     if new_mode is not None:
                         yield {"type": "mode_change", "mode": str(new_mode)}
+                    if context_usage is not None:
+                        yield {"type": "context", "usage": context_usage}
                     yield {
                         "type": "node_done",
                         "node": node_name,

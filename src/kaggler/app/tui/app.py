@@ -49,7 +49,7 @@ from kaggler.app.tui.screens import (
     DirectoryBrowserScreen,
     FilePickerScreen,
 )
-from kaggler.app.tui.widgets import ChatMessage, TraceLine, TraceTable
+from kaggler.app.tui.widgets import ChatMessage, ContextMeter, TraceLine, TraceTable
 from kaggler.modes.common.compute import list_files
 from kaggler.shared.session_manager import SessionManager
 from kaggler.shared.types import Mode
@@ -132,8 +132,9 @@ class KagglerTUI(App[None]):
         with Horizontal(id="main"):
             # 左栏：单一对话窗
             yield VerticalScroll(id="chat-log")
-            # 右栏：Agent 行为追溯
+            # 右栏：上下文占用面板 + Agent 行为追溯
             with Vertical(id="trace-col"):
+                yield ContextMeter(id="context-meter")
                 yield Label("Agent 行为", classes="panel-title")
                 yield VerticalScroll(id="agent-trace")
         with Vertical(id="bottom-bar"):
@@ -289,6 +290,9 @@ class KagglerTUI(App[None]):
 
         elif t == "mode_change":
             self._update_status_bar(e["mode"])
+
+        elif t == "context":
+            self._update_context_meter(e["usage"])
 
         elif t == "turn_done":
             self._finalize_streaming()
@@ -483,6 +487,10 @@ class KagglerTUI(App[None]):
             )
         )
 
+    def _update_context_meter(self, usage: dict) -> None:
+        """刷新右栏「上下文占用」面板（context 事件驱动，每轮数次、非每 token）。"""
+        self.query_one("#context-meter", ContextMeter).update_usage(usage)
+
     def _enable_input(self) -> None:
         inp = self.query_one("#user-input", Input)
         inp.disabled = False
@@ -498,6 +506,7 @@ class KagglerTUI(App[None]):
         self._active_trace_node = None
         self.query_one("#chat-log", VerticalScroll).remove_children()
         self.query_one("#agent-trace", VerticalScroll).remove_children()
+        self.query_one("#context-meter", ContextMeter).clear()
 
     def _replay_history(self, history: list[dict[str, str]]) -> None:
         """恢复对话时把 checkpoint 中的历史消息重绘到左栏（用户/助手两类）。"""

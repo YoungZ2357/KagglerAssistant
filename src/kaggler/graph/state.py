@@ -29,5 +29,7 @@ class CommonState(MessagesState):
     turn: Annotated[int, _add_turns]
     summary: str
     data_version: Annotated[int, _take_latest]
+    # 最近一次 react invoke 的上下文 token 分类拆分（含校准系数），供 TUI 可视化。
+    context_usage: Annotated[dict, _take_latest]
 
 

@@ -5,6 +5,7 @@ from langchain_core.tools import BaseTool
 from kaggler.graph.state import CommonState
 from kaggler.shared.types import Mode
 from kaggler.shared.config import GraphConfig
+from kaggler.shared.token_estimate import build_breakdown, next_calibration_factor
 
 SUMMARY_TEMPLATE = (
     "[对话摘要]\n"
@@ -41,14 +42,15 @@ def react_node(
 
     # 系统提示词：每 turn 用当前 state 现填，str.replace 对 JSON 花括号免疫
     schema = state.get("explored_schema", "")
-    system_text = prompt_templates[mode].replace("{schema}", schema)
+    base_text = prompt_templates[mode].replace("{schema}", schema)
 
     # (a) 注入对话摘要：summarize 节点删除的旧历史经此回注 react，否则压缩=信息净丢失。
     # 摘要仅对 Agent 可见——Agent 应在回复中自然体现对上下文的了解（如引用之前的分析结论），
     # 但除非被明确问到，不应向用户逐字复述摘要内容。
     summary = state.get("summary", "")
+    summary_block = ""
     if summary:
-        system_text += (
+        summary_block = (
             f"\n\n[Agent对之前对话的已知信息]\n"
             f"以下是你与用户之前对话的压缩摘要。你应当基于此理解上下文、"
             f"延续之前的分析，但不要向用户逐字复述这些内容，"
@@ -58,17 +60,35 @@ def react_node(
     # (b) 显式声明当前可调用工具集：切模式后绑定集已变，但历史/摘要里仍残留旧模式的
     # tool_calls 与结果，模型可能据此误调未绑定的工具。每 turn 现填当前工具名以正视听。
     tool_names = ", ".join(t.name for t in tools)
-    system_text += (
+    tools_block = (
         f"\n\n[当前可调用工具] 仅以下工具可用，切勿调用未列出的工具：{tool_names}"
     )
 
+    system_text = base_text + summary_block + tools_block
     system = SystemMessage(content=system_text)
+
+    # 上下文占用估算（离线，未乘校准系数）：系统提示词 = 模板 + 工具名块，摘要块单列。
+    prev_factor = (state.get("context_usage") or {}).get("calibration_factor", 1.0)
+    breakdown = build_breakdown(
+        system_prompt_text=base_text + tools_block,
+        summary_text=summary_block,
+        tools=tools,
+        messages=state["messages"],
+    )
 
     # system 仅临时置于最前，用于本次 invoke；不写回 state、不进 messages 历史
     response = bound.invoke([system, *state["messages"]])
 
-    # 只把 LLM 回复累积进 state（messages 的 reducer 负责 append）
-    return {"messages": [response]}
+    # 用真实 prompt token 数（若模型回传）自适应校准离线估算。
+    usage = getattr(response, "usage_metadata", None)
+    actual = usage.get("input_tokens") if usage else None
+    breakdown.calibration_factor = next_calibration_factor(
+        prev_factor, breakdown.estimated_total_raw, actual
+    )
+    breakdown.actual_total = actual
+
+    # 只把 LLM 回复累积进 state（messages 的 reducer 负责 append），并携出上下文占用拆分。
+    return {"messages": [response], "context_usage": breakdown.to_dict()}
 
 
 

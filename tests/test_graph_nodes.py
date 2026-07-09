@@ -132,7 +132,43 @@ class TestReactNode:
             prompt_templates={Mode.EDA: "{schema}"},
             common_tools=[],
         )
-        assert out == {"messages": [resp]}
+        assert out["messages"] == [resp]
+        assert "context_usage" in out
+
+    def test_context_usage_emitted(self, fake_llm):
+        out = react_node(
+            self._state(),
+            llm=fake_llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "模板 {schema}"},
+            common_tools=[_common_tool],
+        )
+        cu = out["context_usage"]
+        assert set(cu["categories"]) == {
+            "system", "summary", "tools", "user", "assistant", "tool_results",
+        }
+        assert cu["recommended"] == 256_000 and cu["limit"] == 1_000_000
+        # 无 usage_metadata（假 LLM）→ 无实测、系数不动
+        assert cu["actual_total"] is None
+        assert cu["calibration_factor"] == 1.0
+
+    def test_context_usage_captures_actual_and_calibrates(self, make_fake_llm):
+        resp = AIMessage(
+            content="ok",
+            usage_metadata={"input_tokens": 1234, "output_tokens": 5, "total_tokens": 1239},
+        )
+        llm = make_fake_llm(resp)
+        out = react_node(
+            self._state(summary="较长的中文摘要内容片段" * 20),
+            llm=llm,
+            tools_by_mode={Mode.EDA: [_eda_tool]},
+            prompt_templates={Mode.EDA: "模板 {schema}"},
+            common_tools=[_common_tool],
+        )
+        cu = out["context_usage"]
+        assert cu["actual_total"] == 1234
+        assert cu["total"] == 1234  # 有实测取实测
+        assert cu["calibration_factor"] != 1.0  # 已按实测校准
 
     def test_common_tools_none_ok(self, fake_llm):
         react_node(

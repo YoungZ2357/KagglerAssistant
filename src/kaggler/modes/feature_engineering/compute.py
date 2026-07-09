@@ -17,6 +17,7 @@ from kaggler.shared.serialization import safe_val
 from kaggler.modes.feature_engineering.codegen import (
     col as _col,
     combine_expr_code,
+    fmt_list,
     fmt_scalar,
     mono_expr_code,
     over_code,
@@ -81,6 +82,99 @@ def _resolve_group(df: pl.DataFrame, pair: dict) -> tuple | None:
         return (g, None, [f"分组列 '{g}' 为常数，无法分箱，已退化为按取值分组"])
     edges = [gmin + i * (gmax - gmin) / gbins for i in range(gbins + 1)]
     return (g, edges[1:-1], [])
+
+
+def _stat_expr(col_name: str, kind: str) -> pl.Expr:
+    """统计量表达式:kind='mean' -> .mean();否则 .median()。"""
+    c = pl.col(col_name)
+    return c.mean() if kind == "mean" else c.median()
+
+
+def _to_float(v):
+    """把 polars 标量统计量归一成 Python float(或 None)。
+
+    保证 repr 干净(避免 numpy 标量的 ``np.float64(..)`` 之类表示),供写死为常量。
+    """
+    return None if v is None else float(v)
+
+
+def _freeze_group_stats(
+    df: pl.DataFrame,
+    col: str,
+    kind: str,
+    group_col: str,
+    group_breaks: list | None,
+) -> list[tuple]:
+    """在训练集上 eager 算出「组键 -> 统计量」映射,供分组填充写死为常量。
+
+    - 分组键与运行/重放时的表达式严格一致:未分箱按原始取值(``pl.col(g)``),
+      分箱按 ``pl.col(g).cut(breaks).cast(pl.String)``(cut 产出 Enum,统一转字符串
+      标签,replace_strict 匹配才稳定)。
+    - drop 掉 null 组键与统计量为空的组:这两类在填充时都应回落到全局兜底,
+      从映射里剔除后天然由外层 ``.fill_null(global)`` 兜住(与旧 ``.over()`` 行为等价)。
+    - 按组键排序:group_by 结果行序不确定,排序保证导出的代码片段可复现。
+    """
+    key_expr = (
+        pl.col(group_col)
+        if group_breaks is None
+        else pl.col(group_col).cut(group_breaks).cast(pl.String)
+    )
+    grp = (
+        df.lazy()
+        .group_by(key_expr.alias("_g"))
+        .agg(_stat_expr(col, kind).alias("_s"))
+        .collect()
+    )
+    pairs = [
+        (k, _to_float(s))
+        for k, s in zip(grp["_g"].to_list(), grp["_s"].to_list())
+        if k is not None and s is not None
+    ]
+    pairs.sort(key=lambda kv: kv[0])
+    return pairs
+
+
+def _stat_fill_expr(spec: dict) -> pl.Expr:
+    """构造 avg/median 的填充表达式:分组统计量与全局兜底均取自写死的常量。
+
+    全局统计量为 None(整列全空,无从拟合)时不发射兜底 ``fill_null`` —— Polars 的
+    ``fill_null(None)`` 会当作“未指定填充值”而报错;此时该表达式退化为原样列(无变换)。
+    """
+    e = pl.col(spec["column"])
+    gmap = spec["group_map"]
+    if spec.get("group_col") and gmap:
+        keys = [k for k, _ in gmap]
+        vals = [v for _, v in gmap]
+        gk = (
+            pl.col(spec["group_col"])
+            if spec["group_breaks"] is None
+            else pl.col(spec["group_col"]).cut(spec["group_breaks"]).cast(pl.String)
+        )
+        e = e.fill_null(gk.replace_strict(keys, vals, default=None))
+    if spec["global_stat"] is not None:
+        e = e.fill_null(spec["global_stat"])
+    return e
+
+
+def _stat_fill_code(spec: dict) -> str:
+    """镜像 _stat_fill_expr 的源码片段(不含 .alias)——常量原样写死。"""
+    code_e = _col(spec["column"])
+    gmap = spec["group_map"]
+    if spec.get("group_col") and gmap:
+        keys = [k for k, _ in gmap]
+        vals = [v for _, v in gmap]
+        gk = (
+            _col(spec["group_col"])
+            if spec["group_breaks"] is None
+            else f"{_col(spec['group_col'])}.cut({spec['group_breaks']!r}).cast(pl.String)"
+        )
+        code_e += (
+            f".fill_null({gk}.replace_strict("
+            f"{fmt_list(keys)}, {fmt_list(vals)}, default=None))"
+        )
+    if spec["global_stat"] is not None:
+        code_e += f".fill_null({fmt_scalar(spec['global_stat'])})"
+    return code_e
 
 
 def exec_empty(
@@ -254,15 +348,20 @@ def exec_empty(
         group_breaks = group[1] if group else None
         group_warns = group[2] if group else []
 
-        if action == FillMethod.AVG:
-            fill_specs.append({"column": col, "type": "mean",
+        if action in (FillMethod.AVG, FillMethod.MEDIAN):
+            # 拟合阶段:在训练集上 eager 算出全局统计量(与分组映射),写死为常量。
+            # 训练集“构造”整个模型 —— 导出的 pipeline 在验证/测试集上不得重算统计量。
+            kind = "mean" if action == FillMethod.AVG else "median"
+            global_stat = _to_float(
+                df[col].mean() if kind == "mean" else df[col].median()
+            )
+            group_map = (
+                _freeze_group_stats(df, col, kind, group_col, group_breaks)
+                if group_col else []
+            )
+            fill_specs.append({"column": col, "type": kind,
                                "group_col": group_col, "group_breaks": group_breaks,
-                               "warnings": group_warns})
-            continue
-
-        if action == FillMethod.MEDIAN:
-            fill_specs.append({"column": col, "type": "median",
-                               "group_col": group_col, "group_breaks": group_breaks,
+                               "global_stat": global_stat, "group_map": group_map,
                                "warnings": group_warns})
             continue
 
@@ -297,18 +396,9 @@ def exec_empty(
             if spec["type"] == "zero":
                 exprs.append(pl.col(col).fill_null(spec["value"]))
             elif spec["type"] in ("mean", "median"):
-                stat = (
-                    pl.col(col).mean() if spec["type"] == "mean"
-                    else pl.col(col).median()
-                )
-                if spec.get("group_col"):
-                    # 组内统计量填充，组内无有效值时回退全局统计量兜底。
-                    exprs.append(
-                        pl.col(col).fill_null(stat.over(_group_key(spec)))
-                        .fill_null(stat)
-                    )
-                else:
-                    exprs.append(pl.col(col).fill_null(stat))
+                # 统计量已在拟合阶段写死为常量(全局标量 + 组键->统计量映射),
+                # 组内无对应值/组键缺失时回落全局兜底。
+                exprs.append(_stat_fill_expr(spec))
             elif spec["type"] == "mode":
                 if spec.get("group_col"):
                     grouped = (
@@ -329,7 +419,7 @@ def exec_empty(
         return lf
 
     # 代码片段:镜像 _op —— 标识列在最前(与 fill 同一 with_columns);
-    # zero/mode 值写死;mean/median 沿用惰性重算(在重放帧上等价)。
+    # zero/mode 值写死;mean/median 的全局统计量与分组映射均已在拟合阶段写死为常量。
     _fill_code: list[str] = []
     for src, indicator_name in indicator_columns:
         _fill_code.append(
@@ -340,14 +430,7 @@ def exec_empty(
         if spec["type"] == "zero":
             _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
         elif spec["type"] in ("mean", "median"):
-            _stat_code = f"{_col(c)}.{spec['type']}()"
-            if spec.get("group_col"):
-                _grouped = over_code(_stat_code, spec["group_col"], spec["group_breaks"])
-                _fill_code.append(
-                    f"{_col(c)}.fill_null({_grouped}).fill_null({_stat_code})"
-                )
-            else:
-                _fill_code.append(f"{_col(c)}.fill_null({_stat_code})")
+            _fill_code.append(_stat_fill_code(spec))
         elif spec["type"] == "mode":
             if spec.get("group_col"):
                 _mode_code = f"{_col(c)}.drop_nulls().mode().first()"

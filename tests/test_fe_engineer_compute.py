@@ -366,7 +366,9 @@ class TestExecuteEmptyValueGrouped:
             df, [{"column": "x", "action": "avg", "group_by": "g"}]
         )
         expected = result["op"](df.lazy()).collect()
-        assert ".over(" in result["code"]
+        # 分组统计量已写死为「组键->值」映射，不再用窗口动态重算
+        assert ".over(" not in result["code"]
+        assert "replace_strict(" in result["code"]
         ns = {"pl": pl, "lf": df.lazy()}
         exec(result["code"], ns)
         replayed = ns["lf"].collect()
@@ -432,10 +434,12 @@ class TestExecuteEmptyValueGrouped:
     def test_ungrouped_code_unchanged(self):
         df = pl.DataFrame({"a": [2.0, None, 4.0]})
         result = execute_empty_value(df, [{"column": "a", "action": "avg"}])
-        # 不传 group_by 时产出代码与分组特性无关，不应含窗口
+        # 不传 group_by 时产出代码与分组特性无关，不应含窗口；
+        # 且全局统计量写死为常量(mean=3.0)，不再动态调用 .mean()
         assert ".over(" not in result["code"]
+        assert ".mean()" not in result["code"]
         assert result["code"] == (
-            "lf = lf.with_columns([\n    pl.col('a').fill_null(pl.col('a').mean())\n])"
+            "lf = lf.with_columns([\n    pl.col('a').fill_null(3.0)\n])"
         )
 
 

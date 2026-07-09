@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 from kaggler.modes.feature_engineering.types import (
     CombineMethod,
     MonoTransform,
@@ -20,8 +22,24 @@ def fmt_scalar(v) -> str:
     """把标量格式化为 Python 字面量源码。
 
     float 用 ``repr`` 保证最短且可精确 round-trip 的表示;str/bool/int/None 亦然。
+    非有限 float(nan/inf)的 ``repr`` 是裸标识符 ``nan``/``inf``,脱离 app 重放时
+    ``exec`` 会抛 ``NameError`` —— 冻结出的统计量常量可能是 nan/inf(如含 NaN 的列),
+    故改写为可求值的 ``float('nan')`` / ``float('inf')`` / ``float('-inf')``。
     """
+    if isinstance(v, float) and not math.isfinite(v):
+        if math.isnan(v):
+            return "float('nan')"
+        return "float('inf')" if v > 0 else "float('-inf')"
     return repr(v)
+
+
+def fmt_list(xs) -> str:
+    """把标量序列格式化为 Python 列表字面量源码,逐元素走 fmt_scalar。
+
+    比 ``repr(list)`` 更稳:能正确写出内含 nan/inf 的列表(用于分组统计量的
+    old/new 映射),而不会产出无法 exec 的裸 ``nan``/``inf``。
+    """
+    return "[" + ", ".join(fmt_scalar(x) for x in xs) + "]"
 
 
 def col(name: str) -> str:

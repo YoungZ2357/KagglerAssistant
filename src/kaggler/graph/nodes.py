@@ -77,13 +77,16 @@ def react_node(
     # (c) 注入待办：每 turn 逐字回注、永不进摘要压缩，确保 Agent 不遗忘自己挂起的建议。
     todos_block = _render_todos_block(state.get("todos") or [])
 
-    system_text = base_text + memory_block + tools_block + todos_block
+    # (d) 注入方案：与待办同源——每 turn 逐字回注、永不压缩，承载尚未定型但重要的规划性思考。
+    plans_block = _render_plans_block(state.get("plans") or [])
+
+    system_text = base_text + memory_block + tools_block + todos_block + plans_block
     system = SystemMessage(content=system_text)
 
-    # 上下文占用估算（离线，未乘校准系数）：系统提示词 = 模板 + 工具名块 + 待办块，记忆块单列。
+    # 上下文占用估算（离线，未乘校准系数）：系统提示词 = 模板 + 工具名块 + 待办块 + 方案块，记忆块单列。
     prev_factor = (state.get("context_usage") or {}).get("calibration_factor", 1.0)
     breakdown = build_breakdown(
-        system_prompt_text=base_text + tools_block + todos_block,
+        system_prompt_text=base_text + tools_block + todos_block + plans_block,
         summary_text=memory_block,
         tools=tools,
         messages=state["messages"],
@@ -112,14 +115,37 @@ def _render_todos_block(todos: list[dict]) -> str:
     status != "done" 的项，附 id 供 complete_todo 引用。
     """
     guidance = (
-        "\n\n[待办管理] 若你向用户提出了尚未执行的后续建议或步骤，"
-        "请调用 add_todo 登记以免遗忘；完成后调用 complete_todo 标记完成。"
+        "\n\n[待办管理] 待办用于「可立即执行的原子步骤」（做完即勾掉）。若你向用户提出了"
+        "尚未执行的后续步骤，请调用 add_todo 登记以免遗忘；完成后调用 complete_todo 标记完成。"
+        "（尚未定型、需反复修订的整体思路/方案请改用 add_plan，见下方[方案管理]。）"
     )
     open_todos = [t for t in todos if t.get("status") != "done"]
     if not open_todos:
         return guidance
     lines = "\n".join(f"- [#{t['id']}] {t['content']}" for t in open_todos)
     return f"{guidance}\n当前未完成的挂起项：\n{lines}"
+
+
+def _render_plans_block(plans: list[dict]) -> str:
+    """渲染方案注入块：始终附「记录/修订」引导，并逐字列出未归档方案的标题+完整正文。
+
+    指引恒在（即使当前无方案），使 Agent 知道可用 add_plan 存放尚未定型的规划性思考；
+    仅展示 status != "archived" 的项，附 id 供 update_plan 引用。方案正文完整注入、
+    永不进摘要压缩，因此规划性思考不会随长程压缩丢失。
+    """
+    guidance = (
+        "\n\n[方案管理] 方案用于「尚未定型但重要、需反复权衡修订的规划性内容」——"
+        "整体思路、初步计划、设计取舍等。用 add_plan 存下正文；随想法演进用 update_plan "
+        "修订（只传要改的字段）；确认采纳置 status=active，作废或被取代置 status=archived。"
+    )
+    live_plans = [p for p in plans if p.get("status") != "archived"]
+    if not live_plans:
+        return guidance
+    blocks = "\n".join(
+        f"── [#{p['id']}] ({p.get('status', 'draft')}) {p.get('title', '')}\n{p.get('content', '')}"
+        for p in live_plans
+    )
+    return f"{guidance}\n当前方案：\n{blocks}"
 
 
 def summary_cutoff(messages: list, *, keep: int, trigger: int) -> int:

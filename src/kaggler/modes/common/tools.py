@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -184,6 +184,9 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         - 你建议了某项后续分析/处理，但当前不适合立即执行
         - 用户暂时转向别的问题，而某个未完成任务需要留待稍后
 
+        待办 vs 方案：待办用于「可立即执行的原子步骤」（做完即勾掉）；若你要记的是
+        尚未定型、需反复权衡修订的整体思路/初步计划/设计取舍，请改用 add_plan。
+
         新待办的编号（id）由系统自动分配；返回结果会告知登记成功。
         本工具不影响数据版本，仅向待办列表追加一项。
         """
@@ -235,6 +238,92 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             ],
         })
 
+    @tool
+    def add_plan(
+            title: Annotated[str, "方案标题，一句话概括这个方案是关于什么的"],
+            content: Annotated[str, "方案正文，可以是多行、较长的详细内容"],
+            tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        """登记一条「方案」——用于存放尚未定型但重要、需要反复修订的策略性内容。
+
+        方案与待办（add_todo）互补：待办是「可立即执行的原子步骤」，做完即勾掉；
+        方案则是「整体思路 / 初步计划 / 待权衡的设计取舍」这类会随讨论演进、需要长期
+        保留并反复改写的长文本。方案会在之后每一轮都完整出现在你的上下文里、且永远不会
+        被对话摘要压缩掉，因此适合承载不能丢失的规划性思考。
+
+        使用情景：
+        - 你想到一个初步方案/技术路线，但尚未与用户敲定，需要先记下来慢慢完善
+        - 你在权衡几种做法的取舍，想把候选方案与利弊存档，稍后再定
+        - 你有一个需要跨多轮逐步细化的整体计划
+
+        新方案的编号（id）由系统自动分配，状态固定登记为 draft（初步草案）。
+        待方案确认采纳后，用 update_plan 将其 status 置为 active；作废/被取代则置为
+        archived（archived 方案不再注入上下文，但数据仍保留）。
+        若你要记的其实是一个可立即执行的原子步骤，请改用 add_todo。
+        本工具不影响数据版本，仅向方案列表追加一项。
+        """
+        return Command(update={
+            "plans": [{"title": title, "content": content, "status": "draft"}],
+            "messages": [
+                ToolMessage(
+                    dumps_cn({"added_plan": title, "status": "draft"}),
+                    tool_call_id=tool_call_id,
+                ),
+            ],
+        })
+
+    @tool
+    def update_plan(
+            plan_id: Annotated[int, "要修订的方案编号（见上下文中的方案列表 [#id]）"],
+            tool_call_id: Annotated[str, InjectedToolCallId],
+            state: Annotated[dict, InjectedState],
+            title: Annotated[str | None, "新的方案标题；不改则留空"] = None,
+            content: Annotated[str | None, "新的方案正文（整体替换）；不改则留空"] = None,
+            status: Annotated[
+                Literal["draft", "active", "archived"] | None,
+                "新的状态：draft=初步草案 / active=已确认采纳 / archived=作废或被取代；不改则留空",
+            ] = None,
+    ) -> Command:
+        """修订某条已存在的方案：可更新标题、正文、状态中的任意组合。
+
+        随想法演进随时调用本工具改写方案：只需传入要变更的字段，未传入的字段保持原值。
+
+        使用情景：
+        - 方案细化/调整：传入新的 content（整体替换正文）或 title
+        - 方案确认采纳：传入 status="active"
+        - 方案作废或被更好的方案取代：传入 status="archived"（此后不再注入上下文）
+
+        plan_id 必须是当前存在的方案编号——它会显示在你上下文的「当前方案」清单里，
+        形如 [#2]。若给定编号不存在，会返回错误提示且不做任何改动。
+        """
+        plans = state.get("plans") or []
+        target = next((p for p in plans if p.get("id") == plan_id), None)
+        if target is None:
+            return Command(update={
+                "messages": [
+                    ToolMessage(
+                        dumps_cn({"error": f"方案编号 {plan_id} 不存在"}),
+                        tool_call_id=tool_call_id,
+                    ),
+                ],
+            })
+        patch: dict = {"id": plan_id}
+        if title is not None:
+            patch["title"] = title
+        if content is not None:
+            patch["content"] = content
+        if status is not None:
+            patch["status"] = status
+        return Command(update={
+            "plans": [patch],
+            "messages": [
+                ToolMessage(
+                    dumps_cn({"updated_plan": plan_id, "changed": [k for k in patch if k != "id"]}),
+                    tool_call_id=tool_call_id,
+                ),
+            ],
+        })
+
     return [
         switch_mode,
         switch_data_version,
@@ -243,4 +332,6 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         export_data_version,
         add_todo,
         complete_todo,
+        add_plan,
+        update_plan,
     ]

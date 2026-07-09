@@ -39,11 +39,12 @@ def _by_name(tools):
 class TestMakeCommonTools:
     def test_returns_all_common_tools(self, data):
         tools = make_tools(data)
-        assert len(tools) == 7
+        assert len(tools) == 9
         assert {t.name for t in tools} == {
             "switch_mode", "switch_data_version", "list_data_versions",
             "list_workspace_files", "export_data_version",
             "add_todo", "complete_todo",
+            "add_plan", "update_plan",
         }
 
     def test_tool_has_docstring(self, data):
@@ -135,7 +136,7 @@ class TestListDataVersions:
 
 class TestTodoTools:
     def test_add_todo_returns_command_without_id(self, data):
-        # add_todo 只提交 content + status，不带 id——id 由 _merge_todos reducer 分配
+        # add_todo 只提交 content + status，不带 id——id 由 _upsert_by_id reducer 分配
         add_todo = _by_name(make_tools(data))["add_todo"]
         cmd = add_todo.func(content="稍后做特征缩放", tool_call_id="tc1")
         assert isinstance(cmd, Command)
@@ -174,6 +175,57 @@ class TestTodoTools:
     def test_complete_todo_empty_state_returns_error(self, data):
         complete_todo = _by_name(make_tools(data))["complete_todo"]
         cmd = complete_todo.func(todo_id=1, tool_call_id="tc4", state={})
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert "error" in payload
+
+
+class TestPlanTools:
+    def test_add_plan_returns_draft_without_id(self, data):
+        # add_plan 只提交 title + content + draft，不带 id——id 由 _upsert_by_id reducer 分配
+        add_plan = _by_name(make_tools(data))["add_plan"]
+        cmd = add_plan.func(title="建模路线", content="先基线后调参", tool_call_id="tc1")
+        assert isinstance(cmd, Command)
+        plans = cmd.update["plans"]
+        assert plans == [{"title": "建模路线", "content": "先基线后调参", "status": "draft"}]
+        assert "id" not in plans[0]
+
+    def test_add_plan_emits_tool_message(self, data):
+        add_plan = _by_name(make_tools(data))["add_plan"]
+        cmd = add_plan.func(title="特征方案", content="正文", tool_call_id="tc-add")
+        msg = cmd.update["messages"][0]
+        assert isinstance(msg, ToolMessage)
+        assert msg.tool_call_id == "tc-add"
+        payload = json.loads(msg.content)
+        assert payload["added_plan"] == "特征方案"
+        assert payload["status"] == "draft"
+
+    def test_update_plan_partial_only_changed_fields(self, data):
+        update_plan = _by_name(make_tools(data))["update_plan"]
+        state = {"plans": [{"id": 2, "title": "T", "content": "old", "status": "draft"}]}
+        cmd = update_plan.func(plan_id=2, tool_call_id="tc2", state=state, content="new")
+        assert cmd.update["plans"] == [{"id": 2, "content": "new"}]
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert payload["updated_plan"] == 2
+        assert payload["changed"] == ["content"]
+
+    def test_update_plan_status_to_archived(self, data):
+        update_plan = _by_name(make_tools(data))["update_plan"]
+        state = {"plans": [{"id": 1, "title": "T", "content": "b", "status": "active"}]}
+        cmd = update_plan.func(plan_id=1, tool_call_id="tc3", state=state, status="archived")
+        assert cmd.update["plans"] == [{"id": 1, "status": "archived"}]
+
+    def test_update_plan_unknown_id_returns_error(self, data):
+        update_plan = _by_name(make_tools(data))["update_plan"]
+        state = {"plans": [{"id": 1, "title": "T", "content": "b", "status": "draft"}]}
+        cmd = update_plan.func(plan_id=99, tool_call_id="tc4", state=state, status="active")
+        assert "plans" not in cmd.update
+        payload = json.loads(cmd.update["messages"][0].content)
+        assert "error" in payload
+        assert "99" in payload["error"]
+
+    def test_update_plan_empty_state_returns_error(self, data):
+        update_plan = _by_name(make_tools(data))["update_plan"]
+        cmd = update_plan.func(plan_id=1, tool_call_id="tc5", state={}, content="x")
         payload = json.loads(cmd.update["messages"][0].content)
         assert "error" in payload
 

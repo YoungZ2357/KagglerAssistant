@@ -6,6 +6,13 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import LabelEncoder
 
+from kaggler.shared.limits import (
+    MAX_COLUMN_LIST,
+    MAX_MAPPING_ENTRIES,
+    MAX_ONEHOT_COLUMNS,
+    MAX_PREVIEW_COLUMNS,
+    cap_list,
+)
 from kaggler.shared.serialization import safe_val
 from kaggler.modes.feature_engineering.types import (
     CombineMethod,
@@ -17,6 +24,28 @@ from kaggler.modes.feature_engineering.types import (
     RowAction,
     RowLogic,
 )
+
+
+def _build_preview(result_df: pl.DataFrame) -> tuple[list[dict], dict | None]:
+    """构造回传给模型的预览：前 3 行、逐格 safe_val，并对过宽的行截列。
+
+    Returns:
+        (preview 行列表, 截断提示 note)。列数未超限时 note 为 None；
+        超限时 note 形如 {"note": "预览仅显示前 k/w 列，完整结构见 explore_schema"}，
+        由调用方 append 进 summary，避免静默截断。
+    """
+    keep_cols, info = cap_list(result_df.columns, MAX_PREVIEW_COLUMNS)
+    preview_rows = result_df.select(keep_cols).head(3).to_dicts()
+    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    note = None
+    if info:
+        note = {
+            "note": (
+                f"预览仅显示前 {info['shown']}/{info['total']} 列，"
+                "完整结构请使用 explore_schema"
+            )
+        }
+    return preview, note
 
 
 def exec_empty(
@@ -173,11 +202,10 @@ def exec_empty(
                 "warnings": [],
             })
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = []
-    for row in preview_rows:
-        preview.append({k: safe_val(v) for k, v in row.items()})
+    preview, _preview_note = _build_preview(result_df)
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -284,13 +312,19 @@ def exec_encode(
             })
             columns_to_drop.append(col)
 
-            summary.append({
+            # 高基数列生成的新列可能极多，回传摘要时截断列名清单（不影响实际编码）。
+            shown_cols, cols_info = cap_list(dummy_cols, MAX_ONEHOT_COLUMNS)
+            one_hot_summary = {
                 "column": col,
                 "method": action.value,
-                "new_columns": dummy_cols,
+                "new_columns": shown_cols,
+                "n_new_columns": len(dummy_cols),
                 "unique_values": unique_count,
                 "warnings": warnings,
-            })
+            }
+            if cols_info:
+                one_hot_summary["new_columns_truncated"] = cols_info
+            summary.append(one_hot_summary)
 
         elif action == EncodeMethod.LABEL:
             vals = df[col].drop_nulls().unique().to_list()
@@ -312,12 +346,20 @@ def exec_encode(
                 "mapping": mapping,
             })
 
-            summary.append({
+            # 高基数列的完整映射可能有上万条；回传摘要时截断（完整映射已进 encode_specs，
+            # 实际编码结果不受影响）。
+            mapping_items = list(mapping.items())
+            shown_items, map_info = cap_list(mapping_items, MAX_MAPPING_ENTRIES)
+            label_summary = {
                 "column": col,
                 "method": action.value,
-                "mapping": {str(k): v for k, v in mapping.items()},
+                "n_categories": len(mapping),
+                "mapping": {str(k): v for k, v in shown_items},
                 "warnings": [],
-            })
+            }
+            if map_info:
+                label_summary["mapping_truncated"] = map_info
+            summary.append(label_summary)
 
     def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
         exprs = []
@@ -362,11 +404,10 @@ def exec_encode(
 
     result_df = _op(df.lazy()).collect()
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = []
-    for row in preview_rows:
-        preview.append({k: safe_val(v) for k, v in row.items()})
+    preview, _preview_note = _build_preview(result_df)
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -418,14 +459,15 @@ def exec_standardize(
 
     result_df = _op(df.lazy()).collect()
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    preview, _preview_note = _build_preview(result_df)
 
     summary = [{
         "columns": columns,
         "description": "z-score标准化（均值=0，标准差=1）",
     }]
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -462,15 +504,21 @@ def exec_drop_columns(
     if result_df.width == 0:
         warnings.append("已删除全部列，数据集为空")
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    preview, _preview_note = _build_preview(result_df)
 
-    summary = [{
+    remaining_shown, remaining_info = cap_list(result_df.columns, MAX_COLUMN_LIST)
+    drop_summary = {
         "dropped_columns": columns,
-        "remaining_columns": result_df.columns,
+        "remaining_columns": remaining_shown,
+        "n_remaining_columns": result_df.width,
         "warnings": warnings,
-    }]
+    }
+    if remaining_info:
+        drop_summary["remaining_columns_truncated"] = remaining_info
+    summary = [drop_summary]
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -634,8 +682,7 @@ def exec_filter_rows(
 
     result_df = _op(df.lazy()).collect()
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    preview, _preview_note = _build_preview(result_df)
 
     summary = [{
         "action": action_enum.value,
@@ -645,6 +692,8 @@ def exec_filter_rows(
         "rows_removed": df.height - result_df.height,
     }]
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -746,20 +795,24 @@ def exec_dim_reduct(
 
         result_df = _op(df.lazy()).collect()
 
-        preview_rows = result_df.head(3).to_dicts()
-        preview = [
-            {k: safe_val(v) for k, v in row.items()} for row in preview_rows
-        ]
+        preview, _preview_note = _build_preview(result_df)
 
-        summary = [{
+        feats_shown, feats_info = cap_list(numeric_cols, MAX_COLUMN_LIST)
+        pca_summary = {
             "method": "pca",
             "n_components": n_components,
-            "original_features": numeric_cols,
+            "original_features": feats_shown,
+            "n_original_features": len(numeric_cols),
             "new_columns": pc_cols,
             "explained_variance_ratio": explained_var,
             "standardized": standardize,
-        }]
+        }
+        if feats_info:
+            pca_summary["original_features_truncated"] = feats_info
+        summary = [pca_summary]
 
+        if _preview_note:
+            summary.append(_preview_note)
         return {
             "op": _op,
             "preview": preview,
@@ -879,22 +932,26 @@ def exec_dim_reduct(
 
         result_df = _op(df_clean.lazy()).collect()
 
-        preview_rows = result_df.head(3).to_dicts()
-        preview = [
-            {k: safe_val(v) for k, v in row.items()} for row in preview_rows
-        ]
+        preview, _preview_note = _build_preview(result_df)
 
-        summary = [{
+        feats_shown, feats_info = cap_list(numeric_cols, MAX_COLUMN_LIST)
+        lda_summary = {
             "method": "lda",
             "n_components": n_components,
             "target": target,
-            "original_features": numeric_cols,
+            "original_features": feats_shown,
+            "n_original_features": len(numeric_cols),
             "new_columns": ld_cols,
             "n_classes": n_classes,
             "standardized": standardize,
             "rows_dropped": rows_dropped,
-        }]
+        }
+        if feats_info:
+            lda_summary["original_features_truncated"] = feats_info
+        summary = [lda_summary]
 
+        if _preview_note:
+            summary.append(_preview_note)
         return {
             "op": _op,
             "preview": preview,
@@ -1036,9 +1093,10 @@ def exec_transform_mono(
             "warnings": warnings,
         })
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    preview, _preview_note = _build_preview(result_df)
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,
@@ -1110,9 +1168,10 @@ def exec_transform_combination(
         "warnings": warnings,
     }]
 
-    preview_rows = result_df.head(3).to_dicts()
-    preview = [{k: safe_val(v) for k, v in row.items()} for row in preview_rows]
+    preview, _preview_note = _build_preview(result_df)
 
+    if _preview_note:
+        summary.append(_preview_note)
     return {
         "op": _op,
         "preview": preview,

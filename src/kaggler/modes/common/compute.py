@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from kaggler.shared.limits import MAX_WORKSPACE_ENTRIES
+
 
 def _format_size(size: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -35,12 +37,19 @@ def list_files(directory: Path) -> str:
     if not items:
         return "(空目录)"
 
+    total = len(items)
+    truncated = total > MAX_WORKSPACE_ENTRIES
+    shown_items = items[:MAX_WORKSPACE_ENTRIES] if truncated else items
+
     lines: list[str] = []
-    for item in items:
+    for item in shown_items:
         if item.is_dir():
             lines.append(f"📁 {item.name}/")
         else:
             size = _format_size(item.stat().st_size)
             lines.append(f"📄 {item.name} ({size})")
+
+    if truncated:
+        lines.append(f"… 还有 {total - MAX_WORKSPACE_ENTRIES} 个条目未显示（共 {total} 个）")
 
     return "\n".join(lines)

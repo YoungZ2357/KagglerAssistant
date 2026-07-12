@@ -6,6 +6,12 @@ import numpy as np
 import polars as pl
 from scipy import stats
 
+from kaggler.shared.limits import (
+    MAX_CORRELATION_PAIRS,
+    MAX_DESCRIBE_COLUMNS,
+    MAX_SCHEMA_COLUMNS,
+    cap_list,
+)
 from kaggler.shared.serialization import safe_val
 
 
@@ -290,7 +296,15 @@ def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
     if not results:
         return {"error": "给定列的组合无法计算任何相关性。"}
 
-    return {
+    # 每种方法的 pair 数是列数的二次量；已按 |value| 降序，超限时保留最相关的前 N 个。
+    truncated: dict[str, dict] = {}
+    for method_name, pairs in list(results.items()):
+        capped, info = cap_list(pairs, MAX_CORRELATION_PAIRS)
+        if info:
+            results[method_name] = capped
+            truncated[method_name] = info
+
+    output = {
         "column_types": {
             c: "numeric" if c in numeric_cols else "categorical"
             for c in columns
@@ -302,6 +316,9 @@ def get_correlation(df: pl.DataFrame, columns: list[str]) -> dict:
         },
         "results": results,
     }
+    if truncated:
+        output["truncated"] = truncated
+    return output
 
 
 def get_schema_report(df: pl.DataFrame) -> dict:
@@ -316,15 +333,19 @@ def get_schema_report(df: pl.DataFrame) -> dict:
     """
     # 获取结构
     schema = df.schema
-    col_names = schema.names()
+    all_col_names = schema.names()
+    total_columns = len(all_col_names)
+
+    # 超宽表只回传前 N 列，避免逐列报告撑爆上下文（样本字符串另由 safe_val 截断）。
+    col_names, cols_trunc = cap_list(all_col_names, MAX_SCHEMA_COLUMNS)
     dtypes = [schema[name] for name in col_names]
 
     total_rows = df.height
 
-    # 初步统计信息(空值、独特值)
+    # 初步统计信息(空值、独特值)——仅对回传的列计算。
     stats_df = df.select([
-        pl.all().null_count().name.prefix("null_"),
-        pl.all().n_unique().name.prefix("unique_")
+        *[pl.col(c).null_count().alias(f"null_{c}") for c in col_names],
+        *[pl.col(c).n_unique().alias(f"unique_{c}") for c in col_names],
     ])
 
     # 获取样本数据
@@ -343,11 +364,15 @@ def get_schema_report(df: pl.DataFrame) -> dict:
             "n_unique": unique_cnt,
             "sample_values": samples,
         })
-    return {
+    report = {
         "total_rows": total_rows,
-        "total_columns": len(col_names),
+        "total_columns": total_columns,
         "columns": columns,
     }
+    if cols_trunc:
+        report["columns_truncated"] = True
+        report["columns_shown"] = cols_trunc["shown"]
+    return report
 
 
 def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
@@ -372,6 +397,9 @@ def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
             "error": "指定的列均为非数值类型，无法计算描述性统计。",
             "non_numeric_columns": non_numeric,
         }
+
+    # 列数过多时只统计前 N 列，避免一次请求全部列撑爆上下文。
+    numeric_cols, cols_trunc = cap_list(numeric_cols, MAX_DESCRIBE_COLUMNS)
 
     agg_exprs = []
     for col in numeric_cols:
@@ -407,6 +435,8 @@ def get_descriptive_statistics(df: pl.DataFrame, columns: list[str]) -> dict:
     output = {"stats": results}
     if non_numeric:
         output["skipped_non_numeric"] = non_numeric
+    if cols_trunc:
+        output["columns_truncated"] = cols_trunc
 
     return output
 

@@ -22,3 +22,6 @@ build/
 # Test
 .coverage
 
+# runtime state (persistence root; overridable via KAGGLER_HOME)
+.kaggler/
+

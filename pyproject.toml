@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "KagglerAssistant"
-version = "0.0.1"
+version = "0.3.0"
 description = ""
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ dependencies = [
     "langchain-core",
     "langgraph",
     "langchain-deepseek",
+    # 下限保证 SqliteSaver.delete_thread 可用（delete_conversation 依赖它清 checkpoint）
+    "langgraph-checkpoint-sqlite>=3.0",
     # Data Processing
     "polars",
     "polars_ds",

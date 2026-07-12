@@ -50,9 +50,21 @@ ChatMessage Markdown {
     background: transparent;
 }
 
-/* 右栏：Agent 行为追溯 */
+/* 右栏：上下文占用面板 + Agent 行为追溯 */
 #trace-col {
     width: 3fr;
+}
+
+/* 上下文占用面板：高度随内容自适应，居于 Agent 行为追溯之上。
+   每轮更新数次（非每 token），无需 :hover 规则（见文件顶部性能戒律）。 */
+#context-meter {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#context-body {
+    height: auto;
+    padding: 0 1;
 }
 
 .panel-title {
@@ -184,4 +196,45 @@ DirectoryTree#db-tree {
 #db-buttons {
     height: auto;
     margin-top: 1;
+}
+
+/* ── 对话列表弹窗 ── */
+
+ConversationListScreen {
+    align: center middle;
+}
+
+#conv-dialog {
+    width: 80;
+    height: 30;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#conv-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+ListView#conv-list {
+    height: 1fr;
+    border: round $panel;
+}
+
+#conv-rename {
+    margin-top: 1;
+}
+
+#conv-rename.hidden {
+    display: none;
+}
+
+#conv-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#conv-buttons Button {
+    margin-right: 1;
 }

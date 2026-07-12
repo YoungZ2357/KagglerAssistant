@@ -12,6 +12,7 @@ class DeepSeekModel(str, Enum):
 class GraphConfig(BaseSettings):
     summary_trigger_count: int = 20
     summary_keep_recent: int = 4
+    key_findings_cap: int = 12
 
 
 

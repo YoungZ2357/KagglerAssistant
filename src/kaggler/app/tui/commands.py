@@ -39,6 +39,22 @@ COMMANDS: dict[str, CommandSpec] = {
         name="load-file",
         description="加载数据集文件",
     ),
+    "select-workspace": CommandSpec(
+        name="select-workspace",
+        description="选择工作区目录（以启用持久化）",
+    ),
+    "ls": CommandSpec(
+        name="ls",
+        description="列出当前工作区文件",
+    ),
+    "export": CommandSpec(
+        name="export",
+        description="导出数据版本：/export [版本号] [路径]（路径给 .py 则导出可复现 Polars 管道脚本）",
+    ),
+    "conversations": CommandSpec(
+        name="conversations",
+        description="列出 / 恢复 / 重命名 / 删除对话",
+    ),
     "exit": CommandSpec(
         name="exit",
         description="退出程序",

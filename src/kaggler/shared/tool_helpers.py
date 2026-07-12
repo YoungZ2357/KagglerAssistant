@@ -40,6 +40,7 @@ def commit_mutation(
         parent=parent_version,
         tool=tool_name,
         description=description,
+        code=result.get("code"),
     )
     payload = {k: result[k] for k in ("rows_before", "rows_after", "preview", "summary")}
     return Command(update={

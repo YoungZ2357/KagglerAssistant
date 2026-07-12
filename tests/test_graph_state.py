@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
-from kaggler.graph.state import CommonState, _add_turns, _take_latest
+from kaggler.graph.state import CommonState, _add_turns, _take_latest, _upsert_by_id
 from kaggler.shared.types import Mode
 
 
@@ -34,8 +34,10 @@ class TestCommonState:
             "file_path": "data.csv",
             "explored_schema": "",
             "turn": 0,
-            "summary": "",
+            "memory": {},
             "data_version": 0,
+            "todos": [],
+            "plans": [],
         }
         assert state["current_mode"] == Mode.EDA
         assert state["data_version"] == 0
@@ -49,6 +51,91 @@ class TestTakeLatest:
 
     def test_single_write_replaces(self):
         assert _take_latest(3, 3) == 3
+
+
+class TestUpsertById:
+    """通用 upsert reducer（todos / plans 共用）。用待办形状覆盖基本语义。"""
+
+    def test_none_inputs_yield_empty(self):
+        assert _upsert_by_id(None, None) == []
+
+    def test_new_todo_gets_id_one_when_empty(self):
+        out = _upsert_by_id([], [{"content": "a", "status": "open"}])
+        assert out == [{"content": "a", "status": "open", "id": 1}]
+
+    def test_new_todo_id_continues_from_max(self):
+        current = [{"id": 5, "content": "old", "status": "open"}]
+        out = _upsert_by_id(current, [{"content": "new", "status": "open"}])
+        assert {t["id"] for t in out} == {5, 6}
+
+    def test_update_existing_merges_fields(self):
+        current = [{"id": 2, "content": "x", "status": "open"}]
+        out = _upsert_by_id(current, [{"id": 2, "status": "done"}])
+        assert out == [{"id": 2, "content": "x", "status": "done"}]
+
+    def test_two_new_in_one_update_do_not_collide(self):
+        # 同一 update 批内两条新待办应拿到不同 id
+        out = _upsert_by_id([], [
+            {"content": "a", "status": "open"},
+            {"content": "b", "status": "open"},
+        ])
+        assert sorted(t["id"] for t in out) == [1, 2]
+
+    def test_unknown_id_inserted_as_new(self):
+        out = _upsert_by_id([], [{"id": 7, "content": "z", "status": "done"}])
+        assert out == [{"id": 7, "content": "z", "status": "done"}]
+
+
+class TestUpsertByIdPlans:
+    """方案形状：验证长文本部分更新与三态生命周期。"""
+
+    def test_new_plan_defaults_and_gets_id(self):
+        out = _upsert_by_id([], [{"title": "T", "content": "body", "status": "draft"}])
+        assert out == [{"title": "T", "content": "body", "status": "draft", "id": 1}]
+
+    def test_partial_update_preserves_untouched_fields(self):
+        # 只改 content，title / status 应保留
+        current = [{"id": 1, "title": "T", "content": "old", "status": "draft"}]
+        out = _upsert_by_id(current, [{"id": 1, "content": "new"}])
+        assert out == [{"id": 1, "title": "T", "content": "new", "status": "draft"}]
+
+    def test_status_lifecycle_draft_active_archived(self):
+        s = [{"id": 1, "title": "T", "content": "b", "status": "draft"}]
+        s = _upsert_by_id(s, [{"id": 1, "status": "active"}])
+        assert s[0]["status"] == "active"
+        s = _upsert_by_id(s, [{"id": 1, "status": "archived"}])
+        assert s[0]["status"] == "archived"
+        assert s[0]["content"] == "b"  # 状态流转不丢正文
+
+
+class TestMergeTodosInGraph:
+    """端到端：真实 CommonState 上，一个 super-step 内两次 add_todo（各返回 Command
+    写 todos）应逐条 fold、各得独立 id，而非抛 InvalidUpdateError 或互相覆盖。"""
+
+    def test_two_adds_in_one_step_both_persisted(self):
+        @tool
+        def add(content: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+            """追加一条待办。"""
+            return Command(update={
+                "todos": [{"content": content, "status": "open"}],
+                "messages": [ToolMessage("ok", tool_call_id=tool_call_id)],
+            })
+
+        builder = StateGraph(CommonState)
+        builder.add_node("tools", ToolNode([add], handle_tool_errors=True))
+        builder.add_edge(START, "tools")
+        builder.add_edge("tools", END)
+        graph = builder.compile()
+
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "add", "args": {"content": "first"}, "id": "1"},
+            {"name": "add", "args": {"content": "second"}, "id": "2"},
+        ])
+        out = graph.invoke({"messages": [ai], "todos": []})
+        contents = {t["content"] for t in out["todos"]}
+        ids = {t["id"] for t in out["todos"]}
+        assert contents == {"first", "second"}
+        assert len(ids) == 2  # 两条各得独立 id
 
 
 def _make_multiwrite_graph(field: str):

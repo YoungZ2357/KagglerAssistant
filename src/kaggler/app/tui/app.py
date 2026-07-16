@@ -40,11 +40,10 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.timer import Timer
-from textual.widgets import Header, Input, Label, Static
+from textual.widgets import Button, Header, Input, Label, Static
 
 from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
 from kaggler.app.tui.screens import (
-    ApprovalScreen,
     ConversationAction,
     ConversationListScreen,
     DirectoryBrowserScreen,
@@ -72,7 +71,6 @@ _FLUSH_INTERVAL: float = 0.1
 # 键用图节点名的字符串值（Node 为 str-Enum，故字符串键可被枚举成员命中）。
 _NODE_LABELS: dict[str, str] = {
     "react": "agent",
-    "approval": "approval",
     "tools": "tools",
     "summarize": "summarize",
     "finish": "finish",
@@ -80,12 +78,15 @@ _NODE_LABELS: dict[str, str] = {
 # 无 tool_calls 时各节点 ✓ 行的默认描述
 _NODE_DESC: dict[str, str] = {
     "react": "LLM 决策",
-    "approval": "人工审批",
     "tools": "工具执行",
     "summarize": "压缩对话历史",
 }
-# finish 是内部计数节点（finish_turn），不进 trace
-_SILENT_NODES: frozenset[str] = frozenset({"finish"})
+# 不进 trace 的内部节点：
+# - finish：纯计数节点（finish_turn）；
+# - approval：HITL 审批门。它在每个带 tool_calls 的步骤都会经过，绝大多数是「无需
+#   审批、直接放行」的空跑，若逐次显示「人工审批」会误导。真正发生审批时，用户已能
+#   从审批弹窗与「操作已批准/已拒绝」系统消息中获知，故审批门本身无需在追溯里留行。
+_SILENT_NODES: frozenset[str] = frozenset({"finish", "approval"})
 # trace 行的节点名列宽（对齐用）
 _LABEL_WIDTH: int = 10
 
@@ -93,6 +94,15 @@ _MODE_LABELS: dict[str, str] = {
     "eda": "EDA 探索分析",
     "feature_engineering": "特征工程",
 }
+
+# HITL 副作用标签 → 中文显示名（审批横条里展示）。
+_EFFECT_LABELS: dict[str, str] = {
+    "writes_disk": "磁盘写入",
+    "triggers_materialize": "物化/落地新版本",
+    "mutates_version": "数据版本变更",
+}
+# 审批横条里参数串的最大展示长度（超出截断，避免横条过高）。
+_APPROVAL_ARGS_MAX: int = 300
 
 
 class StreamEvent(Message):
@@ -106,7 +116,10 @@ class StreamEvent(Message):
 class KagglerTUI(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "KagglerAssistant"
-    BINDINGS = [("ctrl+q", "quit", "退出")]
+    BINDINGS = [
+        ("ctrl+q", "quit", "退出"),
+        ("escape", "reject_approval", "拒绝待批操作"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -144,6 +157,14 @@ class KagglerTUI(App[None]):
                 yield Label("Agent 行为", classes="panel-title")
                 yield VerticalScroll(id="agent-trace")
         with Vertical(id="bottom-bar"):
+            # HITL 审批横条：默认隐藏，需要审批时显示在状态栏上方。左侧待批操作信息
+            # （富文本、自动换行），右侧横向按钮组。
+            with Horizontal(id="approval-bar", classes="hidden"):
+                yield Static("", id="approval-info")
+                with Horizontal(id="approval-actions"):
+                    yield Button("批准", id="approval-approve", variant="primary")
+                    yield Button("始终允许此类", id="approval-always")
+                    yield Button("拒绝", id="approval-reject", variant="error")
             yield Static("", id="status-bar")
             # 指令提示行：输入 slash 指令时列出全部候选（命令 / 参数），否则收起。
             yield Static("", id="cmd-hint", markup=False)
@@ -520,16 +541,65 @@ class KagglerTUI(App[None]):
             self._session_manager.delete_conversation(result.thread_id)
             self._system_msg("已删除对话")
 
-    # ── HITL 人工审批 ────────────────────────────────────────────────────
+    # ── HITL 人工审批（状态栏上方的横条，非弹窗）────────────────────────
     def _handle_approval_required(self, payload: dict) -> None:
-        """图在高风险工具调用前暂停：收尾已产出的答复片段并弹出审批弹窗。"""
-        # 先把断点前 react 可能产出的正文定稿（停节流定时器）；随后弹窗接管交互。
+        """图在高风险工具调用前暂停：收尾已产出的答复片段并显示审批横条。"""
+        # 先把断点前 react 可能产出的正文定稿（停节流定时器）；随后横条接管交互。
         self._finalize_streaming()
         self._awaiting_approval = True
-        self.push_screen(ApprovalScreen(payload), self._on_approval_decision)
+        self.query_one("#approval-info", Static).update(
+            self._format_pending((payload or {}).get("pending", []))
+        )
+        self.query_one("#approval-bar").remove_class("hidden")
+        # 审批期间禁用输入框，焦点移到「批准」按钮（可 Tab 切换、回车确认）。
+        self.query_one("#user-input", Input).disabled = True
+        self.query_one("#approval-approve", Button).focus()
+
+    def _format_pending(self, pending: list[dict]) -> Text:
+        """把待批调用渲染为自动换行的富文本（用 Text 而非 markup，避免参数里的
+        方括号/花括号被当作标记解析，同时修复长参数溢出——由容器宽度自动折行）。"""
+        t = Text()
+        t.append("⚠ 高风险操作需确认", style="bold yellow")
+        t.append("　执行后将产生副作用（写盘 / 物化 / 版本变更）", style="dim")
+        for c in pending:
+            name = c.get("name", "?")
+            effects = "、".join(
+                _EFFECT_LABELS.get(e, e) for e in c.get("effects", [])
+            ) or "—"
+            args = c.get("args", {}) or {}
+            arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "（无参数）"
+            if len(arg_str) > _APPROVAL_ARGS_MAX:
+                arg_str = arg_str[:_APPROVAL_ARGS_MAX] + " …"
+            t.append("\n• ")
+            t.append(name, style="bold cyan")
+            t.append(f"（{effects}）  参数：", style="dim")
+            t.append(arg_str)
+        return t
+
+    def _resolve_approval(self, action: str) -> None:
+        """收起审批横条并以给定决策续跑（按钮 / Esc 共用）。"""
+        if not self._awaiting_approval:
+            return
+        self.query_one("#approval-bar").add_class("hidden")
+        self._on_approval_decision({"action": action})
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # 仅处理审批横条的按钮；其余（弹窗内按钮）由各自 Screen 处理，id 不冲突。
+        actions = {
+            "approval-approve": "approve",
+            "approval-always": "always",
+            "approval-reject": "reject",
+        }
+        action = actions.get(event.button.id or "")
+        if action is not None:
+            self._resolve_approval(action)
+
+    def action_reject_approval(self) -> None:
+        # Esc：仅在有待批操作时生效（等价点「拒绝」），否则无动作。
+        self._resolve_approval("reject")
 
     def _on_approval_decision(self, decision: dict | None) -> None:
-        """审批弹窗回调：据决策续跑被暂停的图，或（拒绝时）也照常续跑让模型重规划。"""
+        """据决策续跑被暂停的图，或（拒绝时）也照常续跑让模型重规划。"""
         self._awaiting_approval = False
         decision = decision or {"action": "reject"}
         action = decision.get("action", "reject")

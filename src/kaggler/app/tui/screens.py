@@ -179,65 +179,6 @@ class FilePickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-_EFFECT_LABELS: dict[str, str] = {
-    "writes_disk": "磁盘写入",
-    "triggers_materialize": "物化/落地新版本",
-    "mutates_version": "数据版本变更",
-}
-
-
-class ApprovalScreen(ModalScreen["dict | None"]):
-    """HITL 审批弹窗：图在高风险工具调用前暂停，展示待批调用请用户裁决。
-
-    构造传入 interrupt payload（``{"pending": [{"name","args","effects"}, ...]}``）。
-    返回一个决策 dict（见 graph.hitl 的 resume 契约）：
-    - 「批准」→ ``{"action": "approve"}``（本次放行）
-    - 「始终允许此类」→ ``{"action": "always"}``（放行并记住该类副作用，本会话不再询问）
-    - 「拒绝」/ Escape → ``{"action": "reject"}``（不执行；安全默认）
-    """
-
-    BINDINGS = [("escape", "reject", "拒绝")]
-
-    def __init__(self, payload: dict) -> None:
-        super().__init__()
-        self._pending: list[dict] = list((payload or {}).get("pending", []))
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="approval-dialog"):
-            yield Label("⚠ 高风险操作需要确认", id="approval-title")
-            yield Label(
-                "Agent 请求执行以下操作，执行后将产生副作用（写盘 / 物化 / 版本变更）：",
-                id="approval-subtitle",
-            )
-            for i, call in enumerate(self._pending):
-                yield Label(self._format_call(call), id=f"approval-call-{i}", markup=True)
-            with Horizontal(id="approval-buttons"):
-                yield Button("批准", id="approval-approve", variant="primary")
-                yield Button("始终允许此类", id="approval-always")
-                yield Button("拒绝", id="approval-reject", variant="error")
-
-    @staticmethod
-    def _format_call(call: dict) -> str:
-        name = call.get("name", "?")
-        args = call.get("args", {}) or {}
-        arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "（无参数）"
-        effects = "、".join(
-            _EFFECT_LABELS.get(e, e) for e in call.get("effects", [])
-        ) or "—"
-        return f"• [b cyan]{name}[/b cyan]（{effects}）\n    参数：{arg_str}"
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "approval-approve":
-            self.dismiss({"action": "approve"})
-        elif event.button.id == "approval-always":
-            self.dismiss({"action": "always"})
-        else:  # approval-reject
-            self.dismiss({"action": "reject"})
-
-    def action_reject(self) -> None:
-        self.dismiss({"action": "reject"})
-
-
 @dataclass(frozen=True)
 class ConversationAction:
     """``ConversationListScreen`` 的返回值：对某个对话执行的动作。"""

@@ -13,6 +13,10 @@ class GraphConfig(BaseSettings):
     summary_trigger_count: int = 20
     summary_keep_recent: int = 4
     key_findings_cap: int = 12
+    # HITL 总开关：高风险工具调用（写盘 / 外部触发的 materialize / 版本变更）执行前
+    # 是否插入人工审批断点。经 pydantic-settings 读环境变量（如 KAGGLER_HITL_ENABLED=0）。
+    # 关闭后审批门直接放行，行为与加断点前一致。
+    hitl_enabled: bool = True
 
 
 

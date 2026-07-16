@@ -1,6 +1,6 @@
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from kaggler.graph.edges import entry_condition, route_after_agent
+from kaggler.graph.edges import entry_condition, route_after_agent, route_after_approval
 from kaggler.graph.types import Node
 from kaggler.shared.config import GraphConfig
 
@@ -40,13 +40,14 @@ class TestEntryCondition:
 
 
 class TestRouteAfterAgent:
-    def test_ai_with_tool_calls_goes_tools(self):
+    def test_ai_with_tool_calls_goes_approval(self):
+        # 带 tool_calls 先过 HITL 审批门（门内无需断点时再放行到 tools）
         ai = AIMessage(
             content="",
             tool_calls=[{"name": "f", "args": {}, "id": "tc1"}],
         )
         state = {"messages": [HumanMessage(content="q"), ai]}
-        assert route_after_agent(state) == Node.TOOLS
+        assert route_after_agent(state) == Node.APPROVAL
 
     def test_ai_without_tool_calls_goes_finish(self):
         ai = AIMessage(content="done")
@@ -58,3 +59,17 @@ class TestRouteAfterAgent:
         tm = ToolMessage(content="result", tool_call_id="tc1")
         state = {"messages": [HumanMessage(content="q"), tm]}
         assert route_after_agent(state) == Node.FINISH
+
+
+class TestRouteAfterApproval:
+    def test_remaining_tool_calls_go_tools(self):
+        # 审批放行：AIMessage 仍带 tool_calls → 执行工具
+        ai = AIMessage(content="", tool_calls=[{"name": "f", "args": {}, "id": "tc1"}])
+        state = {"messages": [HumanMessage(content="q"), ai]}
+        assert route_after_approval(state) == Node.TOOLS
+
+    def test_all_rejected_go_react(self):
+        # 全部被拒：门已把 tool_calls 移除 → 回 react 重规划
+        ai = AIMessage(content="（注：操作已被用户拒绝）")
+        state = {"messages": [HumanMessage(content="q"), ai]}
+        assert route_after_approval(state) == Node.REACT

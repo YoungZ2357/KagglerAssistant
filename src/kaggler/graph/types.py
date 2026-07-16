@@ -18,6 +18,7 @@ class Node(str, Enum):
     - 编译期抓拼写错误：``Node.SUMMRIZE`` 是 AttributeError，而非静默失效。
     """
     REACT = "react"
+    APPROVAL = "approval"
     TOOLS = "tools"
     SUMMARIZE = "summarize"
     FINISH = "finish"

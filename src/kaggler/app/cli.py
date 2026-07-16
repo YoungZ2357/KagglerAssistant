@@ -15,10 +15,41 @@ import sys
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 
 from kaggler.graph.assembly import build_graph
 from kaggler.shared.types import Mode
 from kaggler.persistence.data_provider import DataProvider
+
+
+def _ask_approval(payload: dict) -> dict:
+    """HITL：在终端打印待批的高风险操作并读取用户裁决，返回 resume 决策。
+
+    读到 EOF/中断按拒绝处理（安全默认，不执行副作用）。
+    """
+    pending = (payload or {}).get("pending", [])
+    print("\n⚠ 高风险操作需要确认：")
+    for c in pending:
+        print(f"  - {c.get('name')}  副作用={c.get('effects')}  参数={c.get('args')}")
+    try:
+        ans = input("批准执行? [y]是 / [n]否 / [a]本会话始终允许: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans in ("a", "always"):
+        return {"action": "always"}
+    if ans in ("y", "yes"):
+        return {"action": "approve"}
+    return {"action": "reject"}
+
+
+def _run_to_completion(graph, inputs, config: dict) -> dict:
+    """驱动一次运行至结束；遇到 HITL 断点则就地询问并 ``Command(resume=...)`` 续跑。"""
+    state = graph.invoke(inputs, config=config)
+    while "__interrupt__" in state:
+        intr = state["__interrupt__"]
+        decision = _ask_approval(intr[0].value if intr else {})
+        state = graph.invoke(Command(resume=decision), config=config)
+    return state
 
 
 def _last_ai_text(state: dict) -> str:
@@ -64,7 +95,7 @@ def main() -> None:
             }
             seeded = True
 
-        state = graph.invoke(payload, config=config)
+        state = _run_to_completion(graph, payload, config)
         print(_last_ai_text(state))
 
 

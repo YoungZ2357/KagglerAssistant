@@ -11,7 +11,8 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
-from kaggler.graph.edges import entry_condition, route_after_agent
+from kaggler.graph.edges import entry_condition, route_after_agent, route_after_approval
+from kaggler.graph.hitl import build_effects_map, make_approval_gate
 from kaggler.graph.nodes import react_node, summarize_conversation, finish_turn
 from kaggler.graph.state import CommonState
 from kaggler.graph.types import Node
@@ -83,6 +84,12 @@ def build_graph(
         prompt_templates=prompt_templates,
         common_tools=common_tools,
     ))
+    # HITL 审批门：无副作用节点，据各工具声明的副作用标签在高风险调用前 interrupt。
+    # effects_map 从 all_tools 现汇总（工具本地用 mark_effects 声明），新增工具自动纳入。
+    builder.add_node(Node.APPROVAL, make_approval_gate(
+        hitl_enabled=cfg.hitl_enabled,
+        effects_map=build_effects_map(all_tools),
+    ))
     builder.add_node(Node.TOOLS, ToolNode(all_tools, handle_tool_errors=True))
     builder.add_node(Node.SUMMARIZE, partial(
         summarize_conversation,
@@ -96,8 +103,10 @@ def build_graph(
         START, partial(entry_condition, graph_config=cfg), [Node.SUMMARIZE, Node.REACT],
     )
     builder.add_edge(Node.SUMMARIZE, Node.REACT)
-    # react 后：带 tool_calls 去 tools，否则进入收尾节点
-    builder.add_conditional_edges(Node.REACT, route_after_agent, [Node.TOOLS, Node.FINISH])
+    # react 后：带 tool_calls 先过审批门（HITL），否则进入收尾节点
+    builder.add_conditional_edges(Node.REACT, route_after_agent, [Node.APPROVAL, Node.FINISH])
+    # 审批门后：有待执行调用去 tools，全被拒则回 react 重规划
+    builder.add_conditional_edges(Node.APPROVAL, route_after_approval, [Node.TOOLS, Node.REACT])
     builder.add_edge(Node.TOOLS, Node.REACT)
     builder.add_edge(Node.FINISH, END)
 

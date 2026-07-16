@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import Command
 
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
@@ -202,13 +203,32 @@ class AgentSession:
                                                     —— 节点产出一批 state 更新
         - ``{"type": "context", "usage": dict}``    —— react 节点的上下文 token 分类
                                                        拆分（含校准系数），供占用面板可视化
+        - ``{"type": "approval_required", "payload": dict}`` —— HITL 断点：图在高风险
+                                                       工具调用前暂停，payload 含待批调用；
+                                                       UI 收到后应弹窗审批，再调 ``resume``
 
         仅透出节点流转与 tool_calls（Agent 决策了什么 / 调了什么工具）；**不**透出
         tool_result 等数据呈现内容——那是另一类需求，不在追溯范围内。
         """
+        yield from self._consume(self._seed_payload(question))
+
+    def resume(self, decision: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """HITL 断点恢复：以人工审批决策续跑被暂停的图，继续产出同一套事件流。
+
+        ``decision`` 形如 ``{"action": "approve" | "reject" | "always"}``（见
+        graph.hitl 的 resume 契约）。可再次产出 ``approval_required``（本轮还有后续
+        高风险调用），UI 按同一路径处理即可。
+        """
+        yield from self._consume(Command(resume=decision))
+
+    def _consume(self, inputs: Any) -> Iterator[dict[str, Any]]:
+        """驱动一次 ``graph.stream`` 并翻译为 UI 事件；stream_events / resume 共用。
+
+        ``inputs`` 为首轮 payload（新问题）或 ``Command(resume=...)``（断点恢复）。
+        """
         current_node: str | None = None
         for mode, data in self._graph.stream(
-            self._seed_payload(question),
+            inputs,
             config=self._config,
             stream_mode=["updates", "messages"],
         ):
@@ -225,6 +245,14 @@ class AgentSession:
                 ):
                     yield {"type": "token", "content": chunk.content}
             elif mode == "updates":
+                # HITL 断点：审批门 interrupt() 时，updates 批次里出现特殊键 __interrupt__，
+                # 值为 Interrupt 元组（.value 即传给 interrupt 的 payload）。透出后本轮
+                # stream 自然结束（图已暂停），等 UI 审批后调 resume 续跑。
+                if "__interrupt__" in data:
+                    intr = data["__interrupt__"]
+                    payload = intr[0].value if intr else {}
+                    yield {"type": "approval_required", "payload": payload}
+                    continue
                 # updates 批次边界：清空当前节点，使下一次 messages 事件能重新报 active
                 current_node = None
                 for node_name, state_update in data.items():

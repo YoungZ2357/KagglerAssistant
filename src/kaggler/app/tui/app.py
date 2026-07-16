@@ -44,6 +44,7 @@ from textual.widgets import Header, Input, Label, Static
 
 from kaggler.app.tui.commands import COMMANDS, SlashSuggester, hint, parse
 from kaggler.app.tui.screens import (
+    ApprovalScreen,
     ConversationAction,
     ConversationListScreen,
     DirectoryBrowserScreen,
@@ -71,6 +72,7 @@ _FLUSH_INTERVAL: float = 0.1
 # 键用图节点名的字符串值（Node 为 str-Enum，故字符串键可被枚举成员命中）。
 _NODE_LABELS: dict[str, str] = {
     "react": "agent",
+    "approval": "approval",
     "tools": "tools",
     "summarize": "summarize",
     "finish": "finish",
@@ -78,6 +80,7 @@ _NODE_LABELS: dict[str, str] = {
 # 无 tool_calls 时各节点 ✓ 行的默认描述
 _NODE_DESC: dict[str, str] = {
     "react": "LLM 决策",
+    "approval": "人工审批",
     "tools": "工具执行",
     "summarize": "压缩对话历史",
 }
@@ -124,6 +127,8 @@ class KagglerTUI(App[None]):
         self._active_trace: TraceLine | None = None
         # 活动行对应的节点名，防止串行错配到别的节点的 node_done。
         self._active_trace_node: str | None = None
+        # HITL：本轮是否正等待人工审批（弹窗未决）。为真时 turn_done 不重启输入。
+        self._awaiting_approval: bool = False
 
     # ── 布局 ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -257,6 +262,16 @@ class KagglerTUI(App[None]):
         finally:
             self.post_message(StreamEvent({"type": "turn_done"}))
 
+    def _approval_resume_worker(self, decision: dict) -> None:
+        """HITL：以人工审批决策续跑被暂停的图（复用 stream_events 的事件流）。"""
+        try:
+            for ev in self._session.resume(decision):
+                self.post_message(StreamEvent(ev))
+        except Exception as exc:  # noqa: BLE001
+            self.post_message(StreamEvent({"type": "error", "message": str(exc)}))
+        finally:
+            self.post_message(StreamEvent({"type": "turn_done"}))
+
     # ── 事件处理（保持轻量，重活交给节流定时器）──────────────────────────
     def on_stream_event(self, message: StreamEvent) -> None:
         e = message.event
@@ -295,7 +310,13 @@ class KagglerTUI(App[None]):
         elif t == "context":
             self._update_context_meter(e["usage"])
 
+        elif t == "approval_required":
+            self._handle_approval_required(e.get("payload") or {})
+
         elif t == "turn_done":
+            # 等待人工审批时，本轮尚未真正结束：不收尾流式答复、不重启输入（弹窗接管）。
+            if self._awaiting_approval:
+                return
             self._finalize_streaming()
             self._enable_input()
 
@@ -498,6 +519,31 @@ class KagglerTUI(App[None]):
         elif result.action == "delete":
             self._session_manager.delete_conversation(result.thread_id)
             self._system_msg("已删除对话")
+
+    # ── HITL 人工审批 ────────────────────────────────────────────────────
+    def _handle_approval_required(self, payload: dict) -> None:
+        """图在高风险工具调用前暂停：收尾已产出的答复片段并弹出审批弹窗。"""
+        # 先把断点前 react 可能产出的正文定稿（停节流定时器）；随后弹窗接管交互。
+        self._finalize_streaming()
+        self._awaiting_approval = True
+        self.push_screen(ApprovalScreen(payload), self._on_approval_decision)
+
+    def _on_approval_decision(self, decision: dict | None) -> None:
+        """审批弹窗回调：据决策续跑被暂停的图，或（拒绝时）也照常续跑让模型重规划。"""
+        self._awaiting_approval = False
+        decision = decision or {"action": "reject"}
+        action = decision.get("action", "reject")
+        label = {"approve": "已批准", "always": "已批准（本会话始终允许此类）",
+                 "reject": "已拒绝"}.get(action, "已拒绝")
+        self._system_msg(f"操作{label}。")
+        # 为续跑的答复预挂新 widget（沿用本轮 turn_id，与本轮消息/追溯联动）。
+        self._streaming_buf = ""
+        self._streaming_dirty = False
+        self._stream_widget = self._add_message("assistant", "", turn_id=self._turn_id)
+        self._flush_timer.resume()
+        self.run_worker(
+            lambda: self._approval_resume_worker(decision), thread=True, name="stream"
+        )
 
     # ── 流式回答（原地更新当前消息）──────────────────────────────────────
     def _flush_streaming(self) -> None:

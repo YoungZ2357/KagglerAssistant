@@ -38,9 +38,24 @@ def entry_condition(
     return Node.SUMMARIZE if cutoff > 0 else Node.REACT
 
 
-def route_after_agent(state: CommonState) -> Literal[Node.TOOLS, Node.FINISH]:
-    """react 之后路由：最后一条 AIMessage 带 tool_calls 则执行工具，否则进入收尾。"""
+def route_after_agent(state: CommonState) -> Literal[Node.APPROVAL, Node.FINISH]:
+    """react 之后路由：带 tool_calls 先过审批门（HITL 断点），否则进入收尾。
+
+    审批门是无副作用节点：不需断点时直接放行到 TOOLS，需断点时 interrupt 暂停。
+    """
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return Node.APPROVAL
+    return Node.FINISH
+
+
+def route_after_approval(state: CommonState) -> Literal[Node.TOOLS, Node.REACT]:
+    """审批门之后路由：仍有待执行的 tool_calls 则去 TOOLS，否则（全被拒）回 REACT。
+
+    审批门在「拒绝」时会用同 id 覆盖那条 AIMessage、移除被拒调用；若因此不再有
+    tool_calls，则回 REACT 让模型据正文中的拒绝说明重新规划。
+    """
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
         return Node.TOOLS
-    return Node.FINISH
+    return Node.REACT

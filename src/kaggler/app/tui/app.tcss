@@ -238,3 +238,42 @@ ListView#conv-list {
 #conv-buttons Button {
     margin-right: 1;
 }
+
+/* ── HITL 审批弹窗 ── */
+
+ApprovalScreen {
+    align: center middle;
+}
+
+#approval-dialog {
+    width: 70;
+    height: auto;
+    border: round $warning;
+    background: $surface;
+    padding: 1 2;
+}
+
+#approval-title {
+    text-style: bold;
+    color: $warning;
+    margin-bottom: 1;
+}
+
+#approval-subtitle {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+#approval-dialog > Label {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#approval-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#approval-buttons Button {
+    margin-right: 1;
+}

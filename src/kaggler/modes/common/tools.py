@@ -7,6 +7,7 @@ from langchain_core.tools import BaseTool, tool, InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
+from kaggler.graph.hitl import Effect, mark_effects
 from kaggler.modes.common.compute import list_files
 from kaggler.persistence.data_export import EXPORT_SUBDIR, export_and_record
 from kaggler.persistence.data_provider import DataProvider
@@ -35,6 +36,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             ]
         })
 
+    @mark_effects(Effect.TRIGGERS_MATERIALIZE, Effect.MUTATES_VERSION)
     @tool
     def switch_data_version(
             version: int,
@@ -118,6 +120,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             return "错误：不允许访问工作区之外的路径。"
         return list_files(target)
 
+    @mark_effects(Effect.WRITES_DISK)
     @tool
     def export_data_version(
             filename: Annotated[str, "导出文件名或工作区内子路径，如 'submission.csv'"],

@@ -25,8 +25,13 @@ from kaggler.modes.feature_engineering.types import (
     RowAction,
     RowLogic,
 )
+from kaggler.graph.hitl import Effect, mark_effects
 from kaggler.persistence.data_provider import DataProvider
 from kaggler.shared.tool_helpers import commit_mutation
+
+# 全部 FE 工具都经 commit_mutation → add_version：物化新 HEAD（外部触发的 materialize）
+# 并把 IR 落盘到版本账本（写盘）。故统一声明这两类副作用，被 HITL 审批门自动纳入断点。
+_FE_EFFECTS = (Effect.TRIGGERS_MATERIALIZE, Effect.WRITES_DISK)
 
 
 def make_tools(data: DataProvider) -> list[BaseTool]:
@@ -386,7 +391,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
             description=description,
         )
 
-    return [
+    tools = [
         execute_empty_value,
         encode_columns,
         standardize_columns,
@@ -397,3 +402,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         transform_column_mono,
         transform_column_combination,
     ]
+    # 统一声明副作用（本地声明，供 HITL 审批门据标签断点）。
+    for t in tools:
+        mark_effects(*_FE_EFFECTS)(t)
+    return tools

@@ -15,12 +15,15 @@ class TestMode:
 class TestNode:
     def test_member_values(self):
         assert Node.REACT == "react"
+        assert Node.APPROVAL == "approval"
         assert Node.TOOLS == "tools"
         assert Node.SUMMARIZE == "summarize"
         assert Node.FINISH == "finish"
 
     def test_all_members(self):
-        assert {n.value for n in Node} == {"react", "tools", "summarize", "finish"}
+        assert {n.value for n in Node} == {
+            "react", "approval", "tools", "summarize", "finish"
+        }
 
     def test_is_str_enum(self):
         assert isinstance(Node.REACT, str)

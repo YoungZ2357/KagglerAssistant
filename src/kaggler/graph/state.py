@@ -13,6 +13,16 @@ from kaggler.shared.types import Mode
 def _add_turns(current: int, update: int=1) -> int:
     return current + update
 
+def _union_str(current: list[str] | None, update: list[str] | None) -> list[str]:
+    """去重并集合并（保序）。HITL allowlist 用：多次「始终允许」累积、幂等不重复。"""
+    seen = list(current or [])
+    known = set(seen)
+    for x in (update or []):
+        if x not in known:
+            known.add(x)
+            seen.append(x)
+    return seen
+
 def _take_latest(current, update):
     """取最新写入值（后写覆盖先写）。
 
@@ -62,5 +72,8 @@ class CommonState(MessagesState):
     plans: Annotated[list[dict], _upsert_by_id]
     # 最近一次 react invoke 的上下文 token 分类拆分（含校准系数），供 TUI 可视化。
     context_usage: Annotated[dict, _take_latest]
+    # HITL：本会话「始终允许此类」的副作用标签列表（Effect 的字符串值）。随 checkpointer
+    # 持久化，恢复对话后仍生效；由审批门在 resume 决策为 always 时并集写入。
+    hitl_allowlist: Annotated[list[str], _union_str]
 
 

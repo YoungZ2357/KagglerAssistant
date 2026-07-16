@@ -48,7 +48,7 @@ def _by_name(tools):
 
 
 class TestMakeFeatEngTools:
-    def test_returns_eight_named_tools(self, data):
+    def test_returns_nine_named_tools(self, data):
         tools = make_tools(data)
         names = set(_by_name(tools))
         assert names == {
@@ -57,6 +57,7 @@ class TestMakeFeatEngTools:
             "standardize_columns",
             "drop_columns",
             "filter_rows",
+            "create_indicator_column",
             "execute_dim_reduct",
             "transform_column_mono",
             "transform_column_combination",
@@ -166,6 +167,46 @@ class TestMakeFeatEngTools:
             groups=[ConditionGroup(logic="and", conditions=[Condition(column="zzz", op="gt", value=2.0)])],
             group_logic="and",
             action="keep",
+        )
+        update = result_cmd.update
+        assert "data_version" not in update
+        msg = json.loads(update["messages"][0].content)
+        assert "error" in msg
+
+    # --- create_indicator_column ---
+    def test_create_indicator_success(self, data):
+        tool = _by_name(make_tools(data))["create_indicator_column"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_ind_1",
+            groups=[ConditionGroup(logic="and", conditions=[Condition(column="x", op="gt", value=2.0)])],
+            group_logic="or",
+            output_name="x_gt2",
+        )
+        update = result_cmd.update
+        assert update["data_version"] == 1
+        msg = json.loads(update["messages"][0].content)
+        assert msg["rows_before"] == 5
+        assert msg["rows_after"] == 5
+        assert msg["summary"][0]["output_column"] == "x_gt2"
+        assert msg["summary"][0]["rows_flagged"] == 3
+        info = data.get_version_info(1)
+        assert info.parent == 0
+        assert info.tool == "create_indicator_column"
+        assert "x_gt2" in info.description
+        # 新列真的写入了
+        new_df = data.get(1)
+        assert "x_gt2" in new_df.columns
+        assert new_df["x_gt2"].dtype == pl.Int8
+
+    def test_create_indicator_name_conflict_does_not_bump_version(self, data):
+        tool = _by_name(make_tools(data))["create_indicator_column"]
+        result_cmd = tool.func(
+            state={"data_version": 0},
+            tool_call_id="call_ind_2",
+            groups=[ConditionGroup(logic="and", conditions=[Condition(column="x", op="gt", value=2.0)])],
+            group_logic="or",
+            output_name="x",  # 与已有列冲突
         )
         update = result_cmd.update
         assert "data_version" not in update

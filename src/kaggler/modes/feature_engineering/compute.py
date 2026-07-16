@@ -1,5 +1,3 @@
-from functools import reduce
-
 import numpy as np
 import polars as pl
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -14,15 +12,8 @@ from kaggler.shared.limits import (
     cap_list,
 )
 from kaggler.shared.serialization import safe_val
-from kaggler.modes.feature_engineering.codegen import (
-    col as _col,
-    combine_expr_code,
-    fmt_list,
-    fmt_scalar,
-    mono_expr_code,
-    over_code,
-    with_columns_block,
-)
+from kaggler.ir import IRSpec, op_from
+from kaggler.ir.emit import _OP_SYMBOLS
 from kaggler.modes.feature_engineering.types import (
     CombineMethod,
     ComparisonOp,
@@ -134,47 +125,37 @@ def _freeze_group_stats(
     return pairs
 
 
-def _stat_fill_expr(spec: dict) -> pl.Expr:
-    """构造 avg/median 的填充表达式:分组统计量与全局兜底均取自写死的常量。
+def _freeze_group_modes(
+    df: pl.DataFrame,
+    col: str,
+    group_col: str,
+    group_breaks: list | None,
+) -> list[tuple]:
+    """在训练集上 eager 算出「组键 -> 组内众数」映射,供分组 mode 填充冻结进 IR。
 
-    全局统计量为 None(整列全空,无从拟合)时不发射兜底 ``fill_null`` —— Polars 的
-    ``fill_null(None)`` 会当作“未指定填充值”而报错;此时该表达式退化为原样列(无变换)。
+    与 _freeze_group_stats 同构:同一分组键表达式(分箱经 cut→cast(String))、
+    drop 空键组与全空值组(回落全局兜底)、按组键排序保证可复现。
+    组内众数平票时按取值排序取首,冻结结果确定性化(运行时 ``.over()`` 老路的
+    平票顺序无保证 —— 差分测试须用平票无关数据)。
     """
-    e = pl.col(spec["column"])
-    gmap = spec["group_map"]
-    if spec.get("group_col") and gmap:
-        keys = [k for k, _ in gmap]
-        vals = [v for _, v in gmap]
-        gk = (
-            pl.col(spec["group_col"])
-            if spec["group_breaks"] is None
-            else pl.col(spec["group_col"]).cut(spec["group_breaks"]).cast(pl.String)
-        )
-        e = e.fill_null(gk.replace_strict(keys, vals, default=None))
-    if spec["global_stat"] is not None:
-        e = e.fill_null(spec["global_stat"])
-    return e
-
-
-def _stat_fill_code(spec: dict) -> str:
-    """镜像 _stat_fill_expr 的源码片段(不含 .alias)——常量原样写死。"""
-    code_e = _col(spec["column"])
-    gmap = spec["group_map"]
-    if spec.get("group_col") and gmap:
-        keys = [k for k, _ in gmap]
-        vals = [v for _, v in gmap]
-        gk = (
-            _col(spec["group_col"])
-            if spec["group_breaks"] is None
-            else f"{_col(spec['group_col'])}.cut({spec['group_breaks']!r}).cast(pl.String)"
-        )
-        code_e += (
-            f".fill_null({gk}.replace_strict("
-            f"{fmt_list(keys)}, {fmt_list(vals)}, default=None))"
-        )
-    if spec["global_stat"] is not None:
-        code_e += f".fill_null({fmt_scalar(spec['global_stat'])})"
-    return code_e
+    key_expr = (
+        pl.col(group_col)
+        if group_breaks is None
+        else pl.col(group_col).cut(group_breaks).cast(pl.String)
+    )
+    grp = (
+        df.lazy()
+        .group_by(key_expr.alias("_g"))
+        .agg(pl.col(col).drop_nulls().mode().sort().first().alias("_s"))
+        .collect()
+    )
+    pairs = [
+        (k, s)
+        for k, s in zip(grp["_g"].to_list(), grp["_s"].to_list())
+        if k is not None and s is not None
+    ]
+    pairs.sort(key=lambda kv: kv[0])
+    return pairs
 
 
 def exec_empty(
@@ -381,74 +362,39 @@ def exec_empty(
                 })
             continue
 
-    def _group_key(spec):
-        """分组键表达式：无切点按取值分组，有切点先等宽分箱。"""
-        g = spec["group_col"]
-        breaks = spec["group_breaks"]
-        return pl.col(g) if breaks is None else pl.col(g).cut(breaks)
-
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        exprs = []
-        for src, indicator_name in indicator_columns:
-            exprs.append(pl.col(src).is_null().cast(pl.Int8).alias(indicator_name))
-        for spec in fill_specs:
-            col = spec["column"]
-            if spec["type"] == "zero":
-                exprs.append(pl.col(col).fill_null(spec["value"]))
-            elif spec["type"] in ("mean", "median"):
-                # 统计量已在拟合阶段写死为常量(全局标量 + 组键->统计量映射),
-                # 组内无对应值/组键缺失时回落全局兜底。
-                exprs.append(_stat_fill_expr(spec))
-            elif spec["type"] == "mode":
-                if spec.get("group_col"):
-                    grouped = (
-                        pl.col(col).drop_nulls().mode().first().over(_group_key(spec))
-                    )
-                    # 组内众数缺失时回退全局众数(已 eager 算出的字面量)。
-                    exprs.append(
-                        pl.col(col).fill_null(grouped).fill_null(spec["value"])
-                    )
-                else:
-                    exprs.append(pl.col(col).fill_null(spec["value"]))
-        if exprs:
-            lf = lf.with_columns(exprs)
-        if delete_columns:
-            lf = lf.filter(
-                pl.all_horizontal([pl.col(c).is_not_null() for c in delete_columns])
-            )
-        return lf
-
-    # 代码片段:镜像 _op —— 标识列在最前(与 fill 同一 with_columns);
-    # zero/mode 值写死;mean/median 的全局统计量与分组映射均已在拟合阶段写死为常量。
-    _fill_code: list[str] = []
-    for src, indicator_name in indicator_columns:
-        _fill_code.append(
-            f"{_col(src)}.is_null().cast(pl.Int8).alias({indicator_name!r})"
-        )
+    # IR payload:本步的唯一真相 —— 拟合常量(全局统计量/分组映射/众数)全部冻结。
+    # 分组 mode 同样在拟合期冻结为「组键->众数」映射(消除旧 .over() 重放期重算)。
+    _ir_fills: list[dict] = []
     for spec in fill_specs:
         c = spec["column"]
         if spec["type"] == "zero":
-            _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
+            _ir_fills.append({"column": c, "type": "zero", "value": spec["value"]})
         elif spec["type"] in ("mean", "median"):
-            _fill_code.append(_stat_fill_code(spec))
+            _ir_fills.append({
+                "column": c, "type": spec["type"],
+                "group_col": spec.get("group_col"),
+                "group_breaks": spec.get("group_breaks"),
+                "global_stat": spec["global_stat"],
+                "group_map": [list(kv) for kv in spec["group_map"]],
+            })
         elif spec["type"] == "mode":
-            if spec.get("group_col"):
-                _mode_code = f"{_col(c)}.drop_nulls().mode().first()"
-                _grouped = over_code(_mode_code, spec["group_col"], spec["group_breaks"])
-                _fill_code.append(
-                    f"{_col(c)}.fill_null({_grouped})"
-                    f".fill_null({fmt_scalar(spec['value'])})"
-                )
-            else:
-                _fill_code.append(f"{_col(c)}.fill_null({fmt_scalar(spec['value'])})")
-    _code_lines: list[str] = []
-    if _fill_code:
-        _code_lines.append(with_columns_block(_fill_code))
-    if delete_columns:
-        _notnull = ", ".join(f"{_col(c)}.is_not_null()" for c in delete_columns)
-        _code_lines.append(f"lf = lf.filter(pl.all_horizontal([{_notnull}]))")
-    code = "\n".join(_code_lines) or "# (空值处理:无实际变换)"
+            _gmap = (
+                _freeze_group_modes(df, c, spec["group_col"], spec["group_breaks"])
+                if spec.get("group_col") else []
+            )
+            _ir_fills.append({
+                "column": c, "type": "mode", "value": spec["value"],
+                "group_col": spec.get("group_col"),
+                "group_breaks": spec.get("group_breaks"),
+                "group_map": [list(kv) for kv in _gmap],
+            })
+    ir = IRSpec("fill_missing", {
+        "indicators": [list(t) for t in indicator_columns],
+        "fills": _ir_fills,
+        "delete_columns": delete_columns,
+    })
 
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     summary: list[dict] = list(skip_summary)
@@ -508,7 +454,7 @@ def exec_empty(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -662,80 +608,22 @@ def exec_encode(
                 label_summary["mapping_truncated"] = map_info
             summary.append(label_summary)
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        exprs = []
-        for spec in encode_specs:
-            col = spec["column"]
-            if spec["type"] == "one_hot":
-                for v in spec["values"]:
-                    name = f"{col}_{v}"
-                    if spec["has_nulls"]:
-                        exprs.append(
-                            pl.when(pl.col(col) == pl.lit(v))
-                            .then(pl.lit(True))
-                            .when(pl.col(col).is_not_null())
-                            .then(pl.lit(False))
-                            .otherwise(pl.lit(None))
-                            .alias(name)
-                        )
-                    else:
-                        exprs.append(
-                            (pl.col(col) == pl.lit(v)).alias(name)
-                        )
-            elif spec["type"] == "label":
-                mapping = spec["mapping"]
-                exprs.append(
-                    pl.when(pl.col(col).is_null())
-                    .then(None)
-                    .otherwise(
-                        pl.col(col).replace_strict(
-                            old=list(mapping.keys()),
-                            new=list(mapping.values()),
-                            default=None,
-                        )
-                    )
-                    .cast(pl.Int64)
-                    .alias(col)
-                )
-        if exprs:
-            lf = lf.with_columns(exprs)
-        if columns_to_drop:
-            lf = lf.drop(columns_to_drop)
-        return lf
-
-    # 代码片段:镜像 _op —— one_hot 的取值集合、label 的完整映射均写死。
-    _enc_code: list[str] = []
+    # IR payload:one_hot 的取值集合、label 的完整映射(平行对列表)均冻结。
+    _ir_specs: list[dict] = []
     for spec in encode_specs:
-        c = spec["column"]
         if spec["type"] == "one_hot":
-            for v in spec["values"]:
-                name = f"{c}_{v}"
-                if spec["has_nulls"]:
-                    _enc_code.append(
-                        f"pl.when({_col(c)} == pl.lit({fmt_scalar(v)}))"
-                        ".then(pl.lit(True))"
-                        f".when({_col(c)}.is_not_null()).then(pl.lit(False))"
-                        f".otherwise(pl.lit(None)).alias({name!r})"
-                    )
-                else:
-                    _enc_code.append(
-                        f"({_col(c)} == pl.lit({fmt_scalar(v)})).alias({name!r})"
-                    )
-        elif spec["type"] == "label":
-            mapping = spec["mapping"]
-            _enc_code.append(
-                f"pl.when({_col(c)}.is_null()).then(None)"
-                f".otherwise({_col(c)}.replace_strict("
-                f"old={list(mapping.keys())!r}, new={list(mapping.values())!r}, default=None))"
-                f".cast(pl.Int64).alias({c!r})"
-            )
-    _code_lines = []
-    if _enc_code:
-        _code_lines.append(with_columns_block(_enc_code))
-    if columns_to_drop:
-        _code_lines.append(f"lf = lf.drop({columns_to_drop!r})")
-    code = "\n".join(_code_lines) or "# (编码:无实际变换)"
+            _ir_specs.append({
+                "column": spec["column"], "type": "one_hot",
+                "values": spec["values"], "has_nulls": spec["has_nulls"],
+            })
+        else:
+            _ir_specs.append({
+                "column": spec["column"], "type": "label",
+                "mapping": [[k, v] for k, v in spec["mapping"].items()],
+            })
+    ir = IRSpec("encode", {"specs": _ir_specs, "drop_columns": columns_to_drop})
 
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -744,7 +632,7 @@ def exec_encode(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -785,20 +673,11 @@ def exec_standardize(
         col_std = df[c].std()
         stats[c] = (col_mean, col_std)
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        exprs = []
-        for c in columns:
-            mean, std = stats[c]
-            exprs.append(((pl.col(c) - mean) / std).alias(c))
-        return lf.with_columns(exprs)
+    ir = IRSpec("standardize", {"stats": [
+        {"column": c, "mean": stats[c][0], "std": stats[c][1]} for c in columns
+    ]})
 
-    # 代码片段:镜像 _op —— 拟合出的 mean/std 写死。
-    _std_code = [
-        f"(({_col(c)} - {fmt_scalar(stats[c][0])}) / {fmt_scalar(stats[c][1])}).alias({c!r})"
-        for c in columns
-    ]
-    code = with_columns_block(_std_code)
-
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -812,7 +691,7 @@ def exec_standardize(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -838,11 +717,9 @@ def exec_drop_columns(
             "hint": "请先调用 explore_schema 确认列名。",
         }
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return lf.drop(columns)
+    ir = IRSpec("drop_columns", {"columns": columns})
 
-    code = f"lf = lf.drop({columns!r})"
-
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     warnings = []
@@ -866,7 +743,7 @@ def exec_drop_columns(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -874,22 +751,11 @@ def exec_drop_columns(
     }
 
 
-_OP_FUNCS = {
-    ComparisonOp.GT: lambda e, v: e > v,
-    ComparisonOp.LT: lambda e, v: e < v,
-    ComparisonOp.GE: lambda e, v: e >= v,
-    ComparisonOp.LE: lambda e, v: e <= v,
-    ComparisonOp.EQ: lambda e, v: e == v,
-    ComparisonOp.NE: lambda e, v: e != v,
-}
-
-_OP_SYMBOLS = {
-    ComparisonOp.GT: ">",
-    ComparisonOp.LT: "<",
-    ComparisonOp.GE: ">=",
-    ComparisonOp.LE: "<=",
-    ComparisonOp.EQ: "==",
-    ComparisonOp.NE: "!=",
+# 一元运算符（无比较值）的 description 文案。运算符号表(_OP_SYMBOLS)与执行/代码
+# 语义同源,直接复用 ir.emit 的注册表(ComparisonOp 是 str Enum,可直接查 str 键表)。
+_NULL_OP_DESC = {
+    ComparisonOp.IS_NULL: "为空",
+    ComparisonOp.IS_NOT_NULL: "非空",
 }
 
 _LOGIC_SYMBOLS = {
@@ -904,22 +770,18 @@ def _format_condition_value(value) -> str:
     return str(value)
 
 
-def exec_filter_rows(
-    df: pl.DataFrame,
+def _validate_conditions(
     groups: list[dict],
-    group_logic: str,
-    action: str,
-) -> dict:
-    try:
-        action_enum = RowAction(action)
-    except ValueError:
-        return {"error": f"未知的 action: {action}", "hint": "支持的值: keep, delete"}
+    schema,
+    *,
+    require_value: bool = True,
+) -> dict | None:
+    """校验两层条件结构（groups → conditions）。
 
-    try:
-        group_logic_enum = RowLogic(group_logic)
-    except ValueError:
-        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
-
+    通过返回 ``None``；否则返回可直接回传给模型的 error dict。被 exec_filter_rows
+    与 exec_create_indicator 共用，是条件校验的单一真相。一元运算符
+    (is_null/is_not_null) 无需比较值，跳过值-类型兼容校验。
+    """
     if not groups:
         return {"error": "groups 不能为空"}
 
@@ -927,7 +789,6 @@ def exec_filter_rows(
     if empty_group_indices:
         return {"error": f"以下分组下标的 conditions 不能为空：{empty_group_indices}"}
 
-    schema = df.schema
     columns_set = set(schema.names())
     all_conditions = [cond for g in groups for cond in g["conditions"]]
 
@@ -949,13 +810,24 @@ def exec_filter_rows(
 
     for cond in all_conditions:
         col = cond["column"]
-        value = cond["value"]
+        value = cond.get("value")
         dtype = schema[col]
 
         try:
-            ComparisonOp(cond["op"])
+            op = ComparisonOp(cond["op"])
         except ValueError:
             errors.append({"column": col, "error": f"未知的比较运算符: {cond['op']}"})
+            continue
+
+        # 一元运算符：无需比较值，跳过类型兼容校验。
+        if op in _NULL_OP_DESC:
+            continue
+
+        if require_value and value is None:
+            errors.append({
+                "column": col,
+                "error": f"运算符 {op.value} 必须提供比较值 value",
+            })
             continue
 
         if dtype.is_numeric():
@@ -979,79 +851,96 @@ def exec_filter_rows(
         else:
             errors.append({
                 "column": col,
-                "error": f"列 '{col}' 的类型 {dtype} 暂不支持行筛选",
+                "error": f"列 '{col}' 的类型 {dtype} 暂不支持条件比较",
             })
 
     if errors:
         return {"error": "部分条件不合法", "details": errors}
+    return None
 
-    def leaf_expr(cond: dict) -> pl.Expr:
-        op = ComparisonOp(cond["op"])
-        return _OP_FUNCS[op](pl.col(cond["column"]), cond["value"])
 
+def _describe_conditions(
+    groups: list[dict],
+    group_logic_enum: RowLogic,
+) -> str:
+    """把两层条件结构编译成人类可读的中文描述(仅供 summary 展示)。
+
+    被 exec_filter_rows 与 exec_create_indicator 共用。条件的**执行**语义在
+    ir.interpret._conditions_expr,**代码**投影在 ir.emit._conditions_code ——
+    此处只负责文案,不再参与任何计算。
+    """
     def leaf_desc(cond: dict) -> str:
         op = ComparisonOp(cond["op"])
-        return f"{cond['column']} {_OP_SYMBOLS[op]} {_format_condition_value(cond['value'])}"
+        if op in _NULL_OP_DESC:
+            return f"{cond['column']} {_NULL_OP_DESC[op]}"
+        return f"{cond['column']} {_OP_SYMBOLS[op]} {_format_condition_value(cond.get('value'))}"
 
-    group_exprs = []
     group_descs = []
     for g in groups:
         logic = RowLogic(g["logic"])
         conds = g["conditions"]
-
-        expr = leaf_expr(conds[0])
         desc = leaf_desc(conds[0])
         for cond in conds[1:]:
-            expr = (expr & leaf_expr(cond)) if logic == RowLogic.AND else (expr | leaf_expr(cond))
             desc = f"{desc} {_LOGIC_SYMBOLS[logic]} {leaf_desc(cond)}"
-
-        group_exprs.append(expr)
         group_descs.append(f"({desc})" if len(conds) > 1 else desc)
 
-    combined_expr = group_exprs[0]
     combined_desc = group_descs[0]
-    for expr, desc in zip(group_exprs[1:], group_descs[1:]):
-        combined_expr = (
-            (combined_expr & expr) if group_logic_enum == RowLogic.AND else (combined_expr | expr)
-        )
+    for desc in group_descs[1:]:
         combined_desc = f"{combined_desc} {_LOGIC_SYMBOLS[group_logic_enum]} {desc}"
+    return combined_desc
 
-    combined_expr = combined_expr.fill_null(False)
 
-    keep = action_enum == RowAction.KEEP
+def _ir_condition_groups(groups: list[dict]) -> list[dict]:
+    """把(已通过校验的)两层条件结构归一成 JSON 原生形态,供 IR payload 使用。
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        if keep:
-            return lf.filter(combined_expr)
-        else:
-            return lf.filter(~combined_expr)
-
-    # 代码片段:镜像 _op —— 逐叶按 _OP_SYMBOLS(同为合法 Python 运算符)拼出条件表达式,
-    # 组内/组间用 & / | 左结合组合,末尾 fill_null(False),再按 keep/delete 决定是否取反。
-    def _leaf_code(cond: dict) -> str:
-        op = ComparisonOp(cond["op"])
-        return f"({_col(cond['column'])} {_OP_SYMBOLS[op]} {fmt_scalar(cond['value'])})"
-
-    _group_codes: list[str] = []
+    工具层经 ``model_dump(mode="json")`` 传入的已是 str,但直接调用方可能传
+    enum 实例 —— 统一经 enum 取 ``.value`` 归一,一元运算符的 value 归一为 None。
+    """
+    out = []
     for g in groups:
-        logic = RowLogic(g["logic"])
-        conds = g["conditions"]
-        joiner = "&" if logic == RowLogic.AND else "|"
-        expr_c = _leaf_code(conds[0])
-        for cond in conds[1:]:
-            expr_c = f"({expr_c} {joiner} {_leaf_code(cond)})"
-        _group_codes.append(expr_c)
-    combined_code = _group_codes[0]
-    _group_joiner = "&" if group_logic_enum == RowLogic.AND else "|"
-    for gc in _group_codes[1:]:
-        combined_code = f"({combined_code} {_group_joiner} {gc})"
-    combined_code = f"({combined_code}).fill_null(False)"
-    code = (
-        f"lf = lf.filter({combined_code})"
-        if keep
-        else f"lf = lf.filter(~{combined_code})"
-    )
+        out.append({
+            "logic": RowLogic(g["logic"]).value,
+            "conditions": [
+                {
+                    "column": cond["column"],
+                    "op": ComparisonOp(cond["op"]).value,
+                    "value": cond.get("value"),
+                }
+                for cond in g["conditions"]
+            ],
+        })
+    return out
 
+
+def exec_filter_rows(
+    df: pl.DataFrame,
+    groups: list[dict],
+    group_logic: str,
+    action: str,
+) -> dict:
+    try:
+        action_enum = RowAction(action)
+    except ValueError:
+        return {"error": f"未知的 action: {action}", "hint": "支持的值: keep, delete"}
+
+    try:
+        group_logic_enum = RowLogic(group_logic)
+    except ValueError:
+        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
+
+    validation_error = _validate_conditions(groups, df.schema, require_value=True)
+    if validation_error is not None:
+        return validation_error
+
+    combined_desc = _describe_conditions(groups, group_logic_enum)
+
+    ir = IRSpec("filter_rows", {
+        "groups": _ir_condition_groups(groups),
+        "group_logic": group_logic_enum.value,
+        "action": action_enum.value,
+    })
+
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     preview, _preview_note = _build_preview(result_df)
@@ -1068,7 +957,7 @@ def exec_filter_rows(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -1076,24 +965,67 @@ def exec_filter_rows(
     }
 
 
-def _weighted_combo_code(
-    weights: list[tuple[float, list[float]]],
-    numeric_cols: list[str],
-    out_cols: list[str],
-) -> str:
-    """PCA/LDA 降维:把每个分量的 (bias, 权重向量) 转成 with_columns 源码。
+def exec_create_indicator(
+    df: pl.DataFrame,
+    groups: list[dict],
+    group_logic: str,
+    output_name: str,
+) -> dict:
+    """根据逻辑条件新建一个 0/1 指示符列（Int8）。
 
-    镜像 _op:``pl.lit(bias) + pl.col(c)*w + …``(``*`` 先于 ``+``,与逐项累加等价),
-    仅保留非零权重项。
+    满足组合条件的行取 1，否则取 0；条件涉及列为空、无法判断真假的行按 0 处理
+    （combined_expr 末尾 fill_null(False)）。行数不变，仅追加一列。
     """
-    exprs: list[str] = []
-    for i, (bias_val, ws) in enumerate(weights):
-        parts = [f"pl.lit({fmt_scalar(bias_val)})"]
-        for j, c in enumerate(numeric_cols):
-            if ws[j] != 0.0:
-                parts.append(f"{_col(c)} * {fmt_scalar(ws[j])}")
-        exprs.append(f"({' + '.join(parts)}).alias({out_cols[i]!r})")
-    return exprs
+    try:
+        group_logic_enum = RowLogic(group_logic)
+    except ValueError:
+        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
+
+    if not output_name:
+        return {"error": "output_name 不能为空"}
+
+    if output_name in set(df.schema.names()):
+        return {
+            "error": f"新列名与已有列冲突：{output_name}",
+            "hint": "请为 output_name 指定不冲突的名称。",
+        }
+
+    validation_error = _validate_conditions(groups, df.schema, require_value=True)
+    if validation_error is not None:
+        return validation_error
+
+    combined_desc = _describe_conditions(groups, group_logic_enum)
+
+    ir = IRSpec("create_indicator", {
+        "groups": _ir_condition_groups(groups),
+        "group_logic": group_logic_enum.value,
+        "output_name": output_name,
+    })
+
+    _op = op_from(ir.kind, ir.params)
+    result_df = _op(df.lazy()).collect()
+
+    flagged = int(result_df[output_name].sum())
+    preview, _preview_note = _build_preview(result_df)
+
+    summary = [{
+        "output_column": output_name,
+        "condition_description": combined_desc,
+        "group_logic": group_logic_enum.value,
+        "rows_flagged": flagged,
+        "rows_total": result_df.height,
+    }]
+
+    if _preview_note:
+        summary.append(_preview_note)
+    return {
+        "op": _op,
+        "ir": ir,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
 
 
 def exec_dim_reduct(
@@ -1176,22 +1108,15 @@ def exec_dim_reduct(
 
         explained_var = [round(float(v), 6) for v in pca.explained_variance_ratio_]
 
-        def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-            exprs = []
-            for i, (bias_val, ws) in enumerate(weights):
-                expr = pl.lit(bias_val)
-                for j, c in enumerate(numeric_cols):
-                    if ws[j] != 0.0:
-                        expr = expr + pl.col(c) * ws[j]
-                exprs.append(expr.alias(pc_cols[i]))
-            return lf.with_columns(exprs).select(final_cols)
+        ir = IRSpec("dim_reduct", {
+            "method": "pca",
+            "components": [{"bias": b, "weights": ws} for b, ws in weights],
+            "numeric_cols": numeric_cols,
+            "out_cols": pc_cols,
+            "final_cols": final_cols,
+        })
 
-        # 代码片段:镜像 _op —— 折叠了(可选)标准化的线性权重写死。
-        code = (
-            with_columns_block(_weighted_combo_code(weights, numeric_cols, pc_cols))
-            + f"\nlf = lf.select({final_cols!r})"
-        )
-
+        _op = op_from(ir.kind, ir.params)
         result_df = _op(df.lazy()).collect()
 
         preview, _preview_note = _build_preview(result_df)
@@ -1214,7 +1139,7 @@ def exec_dim_reduct(
             summary.append(_preview_note)
         return {
             "op": _op,
-            "code": code,
+            "ir": ir,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -1320,22 +1245,17 @@ def exec_dim_reduct(
                 ws.append(w)
             weights.append((bias, ws))
 
-        def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-            exprs = []
-            for i, (bias_val, ws) in enumerate(weights):
-                expr = pl.lit(bias_val)
-                for j, c in enumerate(numeric_cols):
-                    if ws[j] != 0.0:
-                        expr = expr + pl.col(c) * ws[j]
-                exprs.append(expr.alias(ld_cols[i]))
-            return lf.with_columns(exprs).select(final_cols)
+        # 注意:LDA 的 n_components 可能在拟合后收缩(上方 transformed.shape 处),
+        # payload 用收缩后的 weights/ld_cols/final_cols 构造(此处已是最终值)。
+        ir = IRSpec("dim_reduct", {
+            "method": "lda",
+            "components": [{"bias": b, "weights": ws} for b, ws in weights],
+            "numeric_cols": numeric_cols,
+            "out_cols": ld_cols,
+            "final_cols": final_cols,
+        })
 
-        # 代码片段:镜像 _op —— 折叠了(可选)标准化的线性判别权重写死。
-        code = (
-            with_columns_block(_weighted_combo_code(weights, numeric_cols, ld_cols))
-            + f"\nlf = lf.select({final_cols!r})"
-        )
-
+        _op = op_from(ir.kind, ir.params)
         result_df = _op(df_clean.lazy()).collect()
 
         preview, _preview_note = _build_preview(result_df)
@@ -1360,7 +1280,7 @@ def exec_dim_reduct(
             summary.append(_preview_note)
         return {
             "op": _op,
-            "code": code,
+            "ir": ir,
             "preview": preview,
             "summary": summary,
             "rows_before": df.height,
@@ -1372,22 +1292,6 @@ def exec_dim_reduct(
         "hint": "支持的方法: pca, lda",
     }
 
-
-_MONO_EXPR = {
-    MonoTransform.COS: lambda c, s: c.cos(),
-    MonoTransform.SIN: lambda c, s: c.sin(),
-    MonoTransform.TAN: lambda c, s: c.tan(),
-    MonoTransform.EXP: lambda c, s: c.exp(),
-    MonoTransform.LOG: (
-        lambda c, s: c.log(s["base"]) if s.get("base") is not None else c.log()
-    ),
-    MonoTransform.SQRT: lambda c, s: c.sqrt(),
-    MonoTransform.SQUARE: lambda c, s: c.pow(2),
-    MonoTransform.POWER: lambda c, s: c.pow(s["exponent"]),
-    MonoTransform.LINEAR: lambda c, s: c * s["a"] + s["b"],
-    MonoTransform.RECIPROCAL: lambda c, s: 1.0 / c,
-    MonoTransform.ABS: lambda c, s: c.abs(),
-}
 
 _MONO_NAME_PREFIX = {
     MonoTransform.COS: "cos",
@@ -1402,15 +1306,6 @@ _MONO_NAME_PREFIX = {
     MonoTransform.RECIPROCAL: "recip",
     MonoTransform.ABS: "abs",
 }
-
-_COMBO_EXPR = {
-    CombineMethod.PRODUCT: lambda exprs: reduce(lambda a, b: a * b, exprs),
-    CombineMethod.SUM: lambda exprs: reduce(lambda a, b: a + b, exprs),
-    CombineMethod.MEAN: lambda exprs: reduce(lambda a, b: a + b, exprs) / len(exprs),
-    CombineMethod.DIFFERENCE: lambda exprs: reduce(lambda a, b: a - b, exprs),
-    CombineMethod.RATIO: lambda exprs: reduce(lambda a, b: a / b, exprs),
-}
-
 
 def _default_mono_name(spec: dict) -> str:
     """为一元变换生成默认新列名，如 cos_x、linear_x、power2_x。"""
@@ -1470,22 +1365,21 @@ def exec_transform_mono(
             "hint": "请为 output_name 指定不冲突的名称。",
         }
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        exprs = []
-        for spec, out in zip(specs, resolved):
-            method = MonoTransform(spec["method"])
-            expr = _MONO_EXPR[method](pl.col(spec["column"]), spec)
-            exprs.append(expr.alias(out))
-        return lf.with_columns(exprs)
+    _ir_specs = []
+    for spec, out in zip(specs, resolved):
+        method = MonoTransform(spec["method"])
+        s: dict = {"column": spec["column"], "method": method.value, "output_name": out}
+        if method == MonoTransform.LOG:
+            s["base"] = spec.get("base")
+        elif method == MonoTransform.POWER:
+            s["exponent"] = spec.get("exponent", 2.0)
+        elif method == MonoTransform.LINEAR:
+            s["a"] = spec.get("a", 1.0)
+            s["b"] = spec.get("b", 0.0)
+        _ir_specs.append(s)
+    ir = IRSpec("transform_mono", {"specs": _ir_specs})
 
-    # 代码片段:镜像 _op —— 各一元变换表达式经 codegen._MONO_CODE 转写,常量写死。
-    _mono_code = [
-        f"({mono_expr_code(MonoTransform(spec['method']), spec['column'], spec)})"
-        f".alias({out!r})"
-        for spec, out in zip(specs, resolved)
-    ]
-    code = with_columns_block(_mono_code)
-
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
     summary = []
     for spec, out in zip(specs, resolved):
@@ -1514,7 +1408,7 @@ def exec_transform_mono(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,
@@ -1563,17 +1457,13 @@ def exec_transform_combination(
             "hint": "请为 output_name 指定不冲突的名称。",
         }
 
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        exprs = [pl.col(c) for c in columns]
-        combined = _COMBO_EXPR[method_enum](exprs)
-        return lf.with_columns(combined.alias(output_name))
+    ir = IRSpec("transform_combination", {
+        "columns": columns,
+        "method": method_enum.value,
+        "output_name": output_name,
+    })
 
-    # 代码片段:镜像 _op —— 组合表达式经 codegen._COMBO_CODE 转写。
-    code = (
-        f"lf = lf.with_columns(({combine_expr_code(method_enum, columns)})"
-        f".alias({output_name!r}))"
-    )
-
+    _op = op_from(ir.kind, ir.params)
     result_df = _op(df.lazy()).collect()
 
     warnings = []
@@ -1596,7 +1486,7 @@ def exec_transform_combination(
         summary.append(_preview_note)
     return {
         "op": _op,
-        "code": code,
+        "ir": ir,
         "preview": preview,
         "summary": summary,
         "rows_before": df.height,

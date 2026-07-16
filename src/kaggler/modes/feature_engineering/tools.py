@@ -5,6 +5,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
 from kaggler.modes.feature_engineering.compute import (
+    exec_create_indicator,
     exec_dim_reduct,
     exec_drop_columns,
     exec_empty,
@@ -205,6 +206,47 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         )
 
     @tool
+    def create_indicator_column(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        groups: list[ConditionGroup],
+        group_logic: RowLogic,
+        output_name: str,
+    ) -> Command:
+        """根据逻辑条件新建一个 0/1 指示符列（Int8），附加到数据中（保留原列，不替换）。
+
+        条件采用与 filter_rows 相同的两层结构：
+        - 每个 ConditionGroup 内部用 logic（and/or）组合若干叶子条件（column, op, value）
+        - 多个 ConditionGroup 之间再用顶层 group_logic（and/or）组合
+        满足组合条件的行在新列取 1，否则取 0；条件涉及列为空值、无法判断真假的行按 0 处理。
+        op 除 gt/lt/ge/le/eq/ne 外，还支持 is_null（为空）/is_not_null（非空），
+        用于表达“缺失标识”等条件（此时无需提供 value）。
+
+        注意：output_name 不能与已有列冲突。
+        注意：普通比较运算符的 value 类型必须与列的数据类型匹配（数值列传数字，字符串列传字符串，布尔列传布尔值）。
+        注意：如果你缺乏必要信息，切换至eda模式并使用描述性数据分析
+        使用情景：
+        - 为“缺失本身即信息”生成缺失标识列（用 is_null）
+        - 标记满足某阈值/区间的样本（如 age > 60 记为 1）
+        - 标记命中某类别的样本（如 category == "vip"）
+        - 用且/或组合多个条件构造二元交叉特征
+        """
+        df = data.get(state["data_version"])
+        result = exec_create_indicator(
+            df,
+            groups=[g.model_dump(mode="json") for g in groups],
+            group_logic=group_logic,
+            output_name=output_name,
+        )
+        group_logic_value = getattr(group_logic, "value", group_logic)
+        return commit_mutation(
+            data, result, tool_call_id,
+            parent_version=state["data_version"],
+            tool_name="create_indicator_column",
+            description=f"新建指示符列: {output_name} (group_logic={group_logic_value})",
+        )
+
+    @tool
     def execute_dim_reduct(
         state: Annotated[dict, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
@@ -350,6 +392,7 @@ def make_tools(data: DataProvider) -> list[BaseTool]:
         standardize_columns,
         drop_columns,
         filter_rows,
+        create_indicator_column,
         execute_dim_reduct,
         transform_column_mono,
         transform_column_combination,

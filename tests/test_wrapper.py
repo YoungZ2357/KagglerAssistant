@@ -87,18 +87,22 @@ class TestSeedPayload:
 
 def _seed_ledger(db, tid, csv):
     """用真实 DataProvider+sink 落一个 source + 一个 standardize 版本，返回 (v1, 期望帧)。"""
+    from kaggler.ir import dumps_ir
+
     class _Sink:
-        def record_version(self, version, **kw):
+        def record_version(self, version, *, ir=None, **kw):
             s = VersionLedgerStore(db)
             try:
-                s.record(thread_id=tid, version=version, **kw)
+                s.record(thread_id=tid, version=version,
+                         ir=dumps_ir(ir) if ir is not None else None, **kw)
             finally:
                 s.close()
 
     dp = DataProvider(sink=_Sink())
     root = dp.load_initial(str(csv))
     r = compute.exec_standardize(dp.get(root), ["score"])
-    v1 = dp.add_version(r["op"], parent=root, tool="standardize", description="std", code=r["code"])
+    v1 = dp.add_version(r["op"], parent=root, tool="standardize", description="std",
+                        ir=r["ir"])
     return v1, dp.get(v1)
 
 

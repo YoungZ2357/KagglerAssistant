@@ -1,13 +1,13 @@
-"""数据版本操作账本（version ledger）：逐版本持久化血缘 + 惰性操作代码片段。
+"""数据版本操作账本（version ledger）：逐版本持久化血缘 + IR（中间表示）。
 
 与 DataVersionStore / ConversationStore 同构：独立 SQLite 文件
 （.kaggler/version_ledger.sqlite），不混入 LangGraph checkpoint DB。
 
 用途：DataProvider 的版本图本活在内存，恢复对话会丢失全部派生版本。本账本按
 (thread_id, version) 记录每个版本的 parent / tool / description / reproducible 及其
-Polars 代码片段（source 存读取表达式、派生版本存操作 ``lf`` 的语句），使恢复时能
-重放片段重建整棵版本树。HEAD/当前版本不在此——由 LangGraph checkpoint 的
-``data_version`` 唯一持有。
+IR JSON（kaggler.ir.dumps_ir 产出），使恢复时能经同一 interpreter 重建整棵版本树。
+HEAD/当前版本不在此——由 LangGraph checkpoint 的 ``data_version`` 唯一持有。
+code 列为 IR 重构前的历史遗留，只读保留、不再写入。
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS versions (
     description   TEXT    NOT NULL,
     reproducible  INTEGER NOT NULL DEFAULT 1,
     code          TEXT,
+    ir            TEXT,
     snapshot_path TEXT,
     created_at    TEXT    NOT NULL,
     UNIQUE(thread_id, version)
@@ -46,6 +47,7 @@ class VersionRecord:
     description: str
     reproducible: bool
     code: str | None
+    ir: str | None  # IR 节点的 JSON 文本(kaggler.ir.dumps_ir 产出),恢复真相
     snapshot_path: str | None
     created_at: str
 
@@ -65,6 +67,11 @@ class VersionLedgerStore:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(_SCHEMA)
+            # 幂等补列:CREATE TABLE IF NOT EXISTS 不会改老表,IR 重构前建的库
+            # 缺 ir 列,在此 ALTER 补上(旧行该列为 NULL,恢复时响亮报错)。
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(versions)")}
+            if "ir" not in cols:
+                self._conn.execute("ALTER TABLE versions ADD COLUMN ir TEXT")
             self._conn.commit()
         return self._conn
 
@@ -81,24 +88,28 @@ class VersionLedgerStore:
         tool: str | None,
         description: str,
         reproducible: bool = True,
-        code: str | None,
+        ir: str | None = None,
         snapshot_path: str | None = None,
     ) -> VersionRecord:
-        """登记一个版本。(thread_id, version) 幂等：重放/重复写以最新一条为准。"""
+        """登记一个版本。(thread_id, version) 幂等：重放/重复写以最新一条为准。
+
+        code 物理列保留(旧库兼容、免表重建迁移)但**不再写入**——IR 重构后
+        持久化真相是 ir 列;``VersionRecord.code`` 仅只读(旧行残值)。
+        """
         conn = self._get_conn()
         cursor = conn.execute(
             "INSERT INTO versions "
             "(thread_id, version, parent, kind, tool, description, reproducible, "
-            "code, snapshot_path, created_at) "
+            "ir, snapshot_path, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(thread_id, version) DO UPDATE SET "
             "parent=excluded.parent, kind=excluded.kind, tool=excluded.tool, "
             "description=excluded.description, reproducible=excluded.reproducible, "
-            "code=excluded.code, snapshot_path=excluded.snapshot_path, "
+            "ir=excluded.ir, snapshot_path=excluded.snapshot_path, "
             "created_at=excluded.created_at",
             (
                 thread_id, version, parent, kind, tool, description,
-                int(reproducible), code, snapshot_path, self._now(),
+                int(reproducible), ir, snapshot_path, self._now(),
             ),
         )
         conn.commit()
@@ -134,6 +145,7 @@ class VersionLedgerStore:
             description=row["description"],
             reproducible=bool(row["reproducible"]),
             code=row["code"],
+            ir=row["ir"],
             snapshot_path=row["snapshot_path"],
             created_at=row["created_at"],
         )

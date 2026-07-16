@@ -25,3 +25,7 @@ build/
 # runtime state (persistence root; overridable via KAGGLER_HOME)
 .kaggler/
 
+
+# Diagram source file
+*.drawio.bkp
+

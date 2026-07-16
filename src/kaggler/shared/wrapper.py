@@ -19,6 +19,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from kaggler.graph.assembly import build_graph
 from kaggler.graph.types import Node
+from kaggler.ir import IRNode, dumps_ir
 from kaggler.shared.types import Mode
 from kaggler.persistence.data_export import ExportResult, export_and_record
 from kaggler.persistence.data_provider import DataProvider
@@ -46,7 +47,7 @@ class _LedgerSink:
         tool: str | None,
         description: str,
         reproducible: bool,
-        code: str | None,
+        ir: IRNode | None,
     ) -> None:
         store = VersionLedgerStore(self._db_path)
         try:
@@ -58,7 +59,7 @@ class _LedgerSink:
                 tool=tool,
                 description=description,
                 reproducible=reproducible,
-                code=code,
+                ir=dumps_ir(ir) if ir is not None else None,
             )
         finally:
             store.close()
@@ -100,7 +101,7 @@ class AgentSession:
         # 有账本记录即为「恢复」——此判定在 load_initial 写入之前做，故可靠。
         records = _read_ledger(version_ledger_db, tid) if version_ledger_db is not None else []
         if records:
-            rebuild_into(data, records, csv_path=csv_path)
+            rebuild_into(data, records)
             self._seeded = True  # 用 checkpoint 里的 data_version，勿再把种子打回 0
         else:
             data.load_initial(csv_path)  # 全新：经 sink 落 v0

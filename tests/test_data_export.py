@@ -141,7 +141,7 @@ def _build_multistep(tmp_path: Path) -> tuple[DataProvider, int]:
     for tool, fn, args in steps:
         r = fn(dp.get(v), *args)
         assert "error" not in r, (tool, r)
-        v = dp.add_version(r["op"], parent=v, tool=tool, description=tool, code=r["code"])
+        v = dp.add_version(r["op"], parent=v, tool=tool, description=tool, ir=r["ir"])
     return dp, v
 
 
@@ -193,14 +193,14 @@ class TestPipelineCodeExport:
 
     def test_non_reproducible_step_raises(self, tmp_path):
         dp, v = _build_multistep(tmp_path)
-        # 追加一个无代码片段的步骤（模拟 eager_op 桥 / 无种子随机）。
-        v_bad = dp.add_version(lambda lf: lf, parent=v, tool="mystery", description="x", code=None)
-        with pytest.raises(ValueError, match="无可生成的 Polars 代码"):
+        # 追加一个无 IR 的步骤（模拟 eager_op 桥 / 无种子随机）。
+        v_bad = dp.add_version(lambda lf: lf, parent=v, tool="mystery", description="x")
+        with pytest.raises(ValueError, match="无 IR 记录"):
             dp.generate_pipeline_code(v_bad)
 
-    def test_source_without_code_raises(self, tmp_path):
-        # add_source 未传 code（如持久化重载未记录来源）→ 无法作为脚本链首。
+    def test_source_without_ir_raises(self, tmp_path):
+        # add_source 未传 ir（如持久化重载未记录来源）→ 无法作为脚本链首。
         dp = DataProvider()
-        v = dp.add_source(lambda: pl.DataFrame({"a": [1]}), description="no-code source")
-        with pytest.raises(ValueError, match="无读取代码"):
+        v = dp.add_source(lambda: pl.DataFrame({"a": [1]}), description="no-ir source")
+        with pytest.raises(ValueError, match="无 IR 记录"):
             dp.generate_pipeline_code(v)

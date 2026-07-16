@@ -14,7 +14,6 @@ from kaggler.modes.feature_engineering.compute import (
     exec_transform_mono,
     ONE_HOT_CARDINALITY_WARN,
 )
-from kaggler.persistence.pipeline_replay import compile_op
 
 
 class TestExecuteEmptyValue:
@@ -269,19 +268,6 @@ class TestExecuteEmptyValue:
         assert out["a"].null_count() == 0
         assert out["b"].to_list() == [0.0, 5.0, 6.0]
 
-    def test_add_indicator_code_fragment_replays(self):
-        df = pl.DataFrame({"a": [1.0, None, 3.0, None]})
-        result = execute_empty_value(
-            df, [{"column": "a", "action": "avg", "add_indicator": True}]
-        )
-        expected = result["op"](df.lazy()).collect()
-        # 代码片段应可脱离 app 独立重放出同样结果
-        ns = {"pl": pl, "lf": df.lazy()}
-        exec(result["code"], ns)
-        replayed = ns["lf"].collect()
-        assert replayed["a_is_missing"].to_list() == expected["a_is_missing"].to_list()
-        assert replayed["a"].to_list() == expected["a"].to_list()
-
 
 class TestExecuteEmptyValueGrouped:
     def test_grouped_avg_categorical(self):
@@ -359,38 +345,6 @@ class TestExecuteEmptyValueGrouped:
         assert out["x"].null_count() == 2
         assert any(s.get("nulls_remaining") == 2 for s in result["summary"])
 
-    def test_grouped_code_fragment_replays_categorical(self):
-        df = pl.DataFrame({
-            "g": ["A", "A", "B", "B"],
-            "x": [10.0, None, 100.0, None],
-        })
-        result = execute_empty_value(
-            df, [{"column": "x", "action": "avg", "group_by": "g"}]
-        )
-        expected = result["op"](df.lazy()).collect()
-        # 分组统计量已写死为「组键->值」映射，不再用窗口动态重算
-        assert ".over(" not in result["code"]
-        assert "replace_strict(" in result["code"]
-        ns = {"pl": pl, "lf": df.lazy()}
-        exec(result["code"], ns)
-        replayed = ns["lf"].collect()
-        assert replayed["x"].to_list() == expected["x"].to_list()
-
-    def test_grouped_code_fragment_replays_binned(self):
-        df = pl.DataFrame({
-            "g": [1.0, 1.0, 10.0, 10.0],
-            "x": [10.0, None, 100.0, None],
-        })
-        result = execute_empty_value(
-            df, [{"column": "x", "action": "avg", "group_by": "g", "group_bins": 2}]
-        )
-        expected = result["op"](df.lazy()).collect()
-        assert ".cut(" in result["code"]
-        ns = {"pl": pl, "lf": df.lazy()}
-        exec(result["code"], ns)
-        replayed = ns["lf"].collect()
-        assert replayed["x"].to_list() == expected["x"].to_list()
-
     def test_error_group_by_unknown_column(self):
         df = pl.DataFrame({"x": [1.0, None, 3.0]})
         result = execute_empty_value(
@@ -431,17 +385,6 @@ class TestExecuteEmptyValueGrouped:
             "无意义" in w
             for s in result["summary"]
             for w in s.get("warnings", [])
-        )
-
-    def test_ungrouped_code_unchanged(self):
-        df = pl.DataFrame({"a": [2.0, None, 4.0]})
-        result = execute_empty_value(df, [{"column": "a", "action": "avg"}])
-        # 不传 group_by 时产出代码与分组特性无关，不应含窗口；
-        # 且全局统计量写死为常量(mean=3.0)，不再动态调用 .mean()
-        assert ".over(" not in result["code"]
-        assert ".mean()" not in result["code"]
-        assert result["code"] == (
-            "lf = lf.with_columns([\n    pl.col('a').fill_null(3.0)\n])"
         )
 
 
@@ -963,30 +906,6 @@ class TestExecCreateIndicator:
             output_name="flag",
         )
         assert "error" in result
-
-    def test_code_replays_to_same_column(self):
-        df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
-        result = exec_create_indicator(
-            df,
-            groups=[_group("and", [_cond("a", "ge", 3)])],
-            group_logic="or",
-            output_name="a_ge3",
-        )
-        via_op = result["op"](df.lazy()).collect()
-        via_code = compile_op(result["code"])(df.lazy()).collect()
-        assert via_code["a_ge3"].to_list() == via_op["a_ge3"].to_list()
-        assert via_code["a_ge3"].dtype == pl.Int8
-
-    def test_is_null_code_replays(self):
-        df = pl.DataFrame({"a": [1.0, None, 3.0]})
-        result = exec_create_indicator(
-            df,
-            groups=[_group("and", [_cond("a", "is_null", None)])],
-            group_logic="or",
-            output_name="a_missing",
-        )
-        via_code = compile_op(result["code"])(df.lazy()).collect()
-        assert via_code["a_missing"].to_list() == [0, 1, 0]
 
 
 class TestExecDimReduct:

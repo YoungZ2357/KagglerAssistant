@@ -20,6 +20,8 @@ from typing import Protocol
 
 import polars as pl
 
+from kaggler.ir import IRNode, IRSpec, emit_code, emit_source_expr
+
 logger = logging.getLogger(__name__)
 
 # 派生 op:把父版本的 LazyFrame 变换为本版本的 LazyFrame。
@@ -56,7 +58,7 @@ class VersionSink(Protocol):
         tool: str | None,
         description: str,
         reproducible: bool,
-        code: str | None,
+        ir: IRNode | None,
     ) -> None: ...
 
 
@@ -82,9 +84,9 @@ class DataProvider:
         self._lineage: dict[int, VersionInfo] = {}
         self._ops: dict[int, Op] = {}          # 派生版本 -> op(source 不在此)
         self._loaders: dict[int, Loader] = {}  # source -> loader(派生版本不在此)
-        # 每个版本对应的 Polars 代码片段(source 存读取表达式,派生版本存操作 lf 的语句);
-        # None 表示该步无法生成代码(如 eager_op 桥),导出管道脚本时据此响亮报错。
-        self._pipeline_code: dict[int, str | None] = {}
+        # 每个版本的 IR 节点(SSOT:持久化与代码导出均由此派生);
+        # None 表示该步无 IR(如 eager_op 桥),恢复/导出时据此响亮报错。
+        self._ir: dict[int, IRNode | None] = {}
 
         # ---- 物化缓存:全部版本的子集 ----
         self._materialized: dict[int, pl.DataFrame] = {}
@@ -110,20 +112,25 @@ class DataProvider:
         description: str,
         tool: str | None = None,
         pin: bool | None = None,
-        code: str | None = None,
+        ir: IRSpec | None = None,
     ) -> int:
         """注册一个 source(无父版本,由 loader 产出)。
 
         供 load_initial 与持久化重载共用。持久化重载时传入 read_parquet loader,
         使被保存的版本以「新 source」身份回归——数据保住,上游 op 血缘不再可重放(符合预期)。
 
-        code:该 source 的 eager 读取表达式源码(如 ``pl.read_csv('train.csv')``),
-              供导出管道脚本时作为链首;None 则该版本不可作为脚本起点。
+        ir:source 的 IRSpec(kind="source");在此与版本号组装成 IRNode(parents=[])
+           落库——恢复(restore)与脚本导出链首的唯一真相。None 则该版本不可被
+           恢复重建、不可作为脚本起点。
         """
         v = self._alloc()
         self._lineage[v] = VersionInfo(parent=None, tool=tool, description=description)
         self._loaders[v] = loader
-        self._pipeline_code[v] = code
+        node = (
+            IRNode(version=v, kind=ir.kind, parents=[], params=ir.params, seed=ir.seed)
+            if ir is not None else None
+        )
+        self._ir[v] = node
         self._materialize(v)  # source 注册即加载
         if pin is None:
             pin = self._pin_root
@@ -137,7 +144,7 @@ class DataProvider:
         if self._sink is not None:
             self._sink.record_version(
                 v, parent=None, kind="source", tool=tool,
-                description=description, reproducible=True, code=code,
+                description=description, reproducible=True, ir=node,
             )
         return v
 
@@ -146,7 +153,7 @@ class DataProvider:
         return self.add_source(
             lambda: pl.read_csv(path),
             description="原始数据集",
-            code=f"pl.read_csv({path!r})",
+            ir=IRSpec("source", {"format": "csv", "path": path}),
         )
 
     # ================= 写:派生新版本 =================
@@ -160,7 +167,7 @@ class DataProvider:
         description: str = "",
         reproducible: bool = True,
         pin: bool = False,
-        code: str | None = None,
+        ir: IRSpec | None = None,
     ) -> int:
         """在 parent 之上应用 op 派生新版本,并使其成为新 HEAD。
 
@@ -168,8 +175,9 @@ class DataProvider:
                             会污染以 data_version 为 key 的下游缓存;持久化时也必须落盘)。
         pin=True:          可复现但昂贵的派生(编码/大 groupby/join)—— 保护其结果不被
                             反复重放穿越。取代自动深度守卫:显式、针对真实成本。
-        code:              与 op 等价的 Polars 代码片段(操作变量 ``lf`` 的语句);None 表示
-                            该步无法生成代码,导出管道脚本时会响亮报错而非产出残缺脚本。
+        ir:                该步的 IRSpec(compute 层产出);在此与 version/parents=[parent]
+                            组装成 IRNode 落库 —— 恢复(restore)与代码导出的唯一真相。
+                            None 表示该步无 IR(如 eager_op 桥),恢复/导出时响亮报错。
         """
         if parent not in self._lineage:
             raise RuntimeError(f"父版本 `{parent}` 不存在")
@@ -177,7 +185,11 @@ class DataProvider:
         v = self._alloc()
         self._lineage[v] = VersionInfo(parent, tool, description, reproducible)
         self._ops[v] = op
-        self._pipeline_code[v] = code
+        node = (
+            IRNode(version=v, kind=ir.kind, parents=[parent], params=ir.params, seed=ir.seed)
+            if ir is not None else None
+        )
+        self._ir[v] = node
 
         # 新 HEAD 立即物化:当前所有分析都打在 HEAD 上,懒化收益来自旧版本降级而非 HEAD 本身。
         self._head = v
@@ -193,7 +205,7 @@ class DataProvider:
         if self._sink is not None:
             self._sink.record_version(
                 v, parent=parent, kind="derived", tool=tool,
-                description=description, reproducible=reproducible, code=code,
+                description=description, reproducible=reproducible, ir=node,
             )
         return v
 
@@ -266,8 +278,8 @@ class DataProvider:
         *,
         description: str,
         tool: str | None,
-        code: str | None,
         loader: Loader,
+        ir: IRNode | None = None,
     ) -> None:
         """用给定版本号登记一个 source,不 _alloc、不写 sink、不立即物化(惰性)。
 
@@ -276,7 +288,7 @@ class DataProvider:
         """
         self._lineage[version] = VersionInfo(parent=None, tool=tool, description=description)
         self._loaders[version] = loader
-        self._pipeline_code[version] = code
+        self._ir[version] = ir
         if self._root is None:
             self._root = version
         if self._pin_root:
@@ -293,12 +305,12 @@ class DataProvider:
         description: str,
         reproducible: bool,
         op: Op,
-        code: str | None,
+        ir: IRNode | None = None,
     ) -> None:
         """用给定版本号登记一个派生版本,不 _alloc、不写 sink、不立即物化(惰性)。"""
         self._lineage[version] = VersionInfo(parent, tool, description, reproducible)
         self._ops[version] = op
-        self._pipeline_code[version] = code
+        self._ir[version] = ir
         if not reproducible:
             self._pinned.add(version)
         self._head = version
@@ -311,17 +323,18 @@ class DataProvider:
         output_path: str | None = None,
         output_fmt: str = "csv",
     ) -> str:
-        """生成复现 ``version`` 的自包含 Polars 管道脚本。
+        """生成复现 ``version`` 的自包含 Polars 管道脚本(IR 的只读投影)。
 
-        沿 _lineage 从 version 回溯到 source(parent 为 None),拼接各版本存下的代码片段——
-        与 _compute 的 replay 同构,只是「拼代码」而非「调闭包」,故产出严格等价于
-        ``get(version)`` 的预处理链。拟合常量已在片段中写死,脚本无需重新拟合。
+        沿 _lineage 从 version 回溯到 source(parent 为 None),对各版本的 IR 节点
+        经 ``ir.emit`` 投影出代码片段拼接 —— 与 _compute 的 replay 同构,只是
+        「emit 代码」而非「调闭包」。拟合常量来自 IR payload 原样写死,脚本无需
+        重新拟合(反数据泄漏不变量)。
 
         output_path 给定时追加 ``df.write_csv/parquet(output_path)``;否则给出注释示例。
 
         Raises:
             RuntimeError: version 不存在。
-            ValueError:   链中任一版本无代码片段(如 eager_op 桥 / 无种子随机),
+            ValueError:   链中任一版本无 IR(如 eager_op 桥 / 无种子随机),
                           脚本无法完整复现,响亮报错而非产出残缺脚本。
         """
         if version not in self._lineage:
@@ -339,10 +352,10 @@ class DataProvider:
         chain.reverse()
 
         source = chain[0]
-        src_code = self._pipeline_code.get(source)
-        if src_code is None:
+        src_node = self._ir.get(source)
+        if src_node is None:
             raise ValueError(
-                f"源版本 `{source}` 无读取代码(可能是持久化重载而未记录来源),无法生成管道脚本"
+                f"源版本 `{source}` 无 IR 记录(可能是持久化重载而未记录来源),无法生成管道脚本"
             )
 
         src_info = self._lineage[source]
@@ -350,20 +363,20 @@ class DataProvider:
             "import polars as pl",
             "",
             f"# 源数据（version {source}）：{src_info.description}",
-            f"lf = ({src_code}).lazy()",
+            f"lf = ({emit_source_expr(src_node)}).lazy()",
         ]
 
         for step, vid in enumerate(chain[1:], start=1):
             info = self._lineage[vid]
-            frag = self._pipeline_code.get(vid)
-            if frag is None:
+            node = self._ir.get(vid)
+            if node is None:
                 raise ValueError(
-                    f"版本 `{vid}`（工具 {info.tool}）无可生成的 Polars 代码，"
+                    f"版本 `{vid}`（工具 {info.tool}）无 IR 记录，"
                     "该数据版本不可复现为脚本"
                 )
             lines.append("")
             lines.append(f"# 步骤 {step}（version {vid}，{info.tool}）：{info.description}")
-            lines.append(frag)
+            lines.append(emit_code(node))
 
         lines.append("")
         lines.append("df = lf.collect()")

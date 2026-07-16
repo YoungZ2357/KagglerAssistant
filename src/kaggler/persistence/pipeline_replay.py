@@ -1,81 +1,80 @@
-"""从持久化账本重建 DataProvider 版本树（codegen 的逆过程）。
+"""从持久化账本重建 DataProvider 版本树。
 
-恢复对话时，把 VersionLedgerStore 里每个版本的 Polars 代码片段编译回 op / loader，
-用原版本号 restore 进一个新的 DataProvider，从而复原整棵版本树（含 fork）。
+恢复对话时，把 VersionLedgerStore 里每个版本的 IR(JSON)反序列化,经
+**与运行时同一个 interpreter**(``kaggler.ir.build_op`` / ``build_loader``)
+重建 op / loader,用原版本号 restore 进一个新的 DataProvider,从而复原
+整棵版本树(含 fork)——单路径不变量:不存在独立于运行时的 restore 构建逻辑。
 
-安全说明：这里 ``exec`` / ``eval`` 的字符串来自本机 ``.kaggler`` 内、由本项目 codegen
-（feature_engineering/codegen.py + DataProvider.load_initial）自产的代码，**非用户输入**；
-执行命名空间被限定为仅含 ``pl``（与 ``lf``）。单用户本地应用的信任模型下可接受。
+旧账本(IR 重构前创建、只有 code 字符串的记录)不再支持恢复,遇到时
+响亮报错提示新建对话。
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import polars as pl
-
-from kaggler.persistence.data_provider import DataProvider, Loader, Op
+from kaggler.ir import build_loader, build_op, loads_ir
+from kaggler.persistence.data_provider import DataProvider
 
 if TYPE_CHECKING:
     from kaggler.persistence.version_ledger_store import VersionRecord
 
 
-def compile_op(code: str) -> Op:
-    """把「重新赋值 ``lf`` 的语句」片段编译成 (LazyFrame)->LazyFrame。
+def _load_node(rec: VersionRecord):
+    """把账本行的 IR JSON 解析为 IRNode,并与账本行交叉校验。
 
-    注释-only 片段（如「# (空值处理:无实际变换)」）exec 后 ``lf`` 不变，原样返回。
+    Raises:
+        ValueError: 记录无 IR(旧版本应用创建的账本,已不支持恢复),或
+                    IR 内容与账本行不一致(version/parent 漂移)。
     """
-    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
-        ns: dict = {"pl": pl, "lf": lf}
-        exec(code, ns)
-        return ns["lf"]
-
-    return _op
-
-
-def compile_loader(code: str) -> Loader:
-    """把 source 读取表达式（如 ``pl.read_csv('train.csv')``）编译成无参 loader。"""
-    def _loader() -> pl.DataFrame:
-        return eval(code, {"pl": pl})
-
-    return _loader
+    if rec.ir is None:
+        raise ValueError(
+            f"版本 `{rec.version}`(工具 {rec.tool})无 IR 记录:该对话由旧版本应用"
+            "创建,无法恢复。请新建对话重新加载数据。"
+        )
+    node = loads_ir(rec.ir)
+    if node.version != rec.version:
+        raise ValueError(
+            f"账本记录与 IR 不一致:账本 version={rec.version},IR version={node.version}"
+        )
+    expected_parents = [] if rec.parent is None else [rec.parent]
+    if node.parents != expected_parents:
+        raise ValueError(
+            f"账本记录与 IR 不一致(version={rec.version}):"
+            f"账本 parent={rec.parent},IR parents={node.parents}"
+        )
+    return node
 
 
 def rebuild_into(
     data: DataProvider,
     records: list[VersionRecord],
-    *,
-    csv_path: str,
 ) -> None:
-    """按 version 升序把账本记录重放进 data，复原版本树。
+    """按 version 升序把账本记录的 IR 重放进 data，复原版本树。
 
     records 需已按 version 升序（VersionLedgerStore.list_by_thread 已保证）。
-    csv_path 仅作 source 无 code 时的兜底读取路径（正常情况下 source 恒有 read 表达式）。
+    op/loader 经 ``build_op``/``build_loader`` 重建——与运行时同一 interpreter。
 
     Raises:
-        ValueError: 派生版本的 code 为 None（无法重建，如未来的 eager_op 桥 / 无种子随机）。
+        ValueError: 任一版本无 IR（旧账本 / eager_op 桥），或 IR 与账本行不一致。
     """
     for rec in records:
+        node = _load_node(rec)
         if rec.kind == "source":
-            loader = compile_loader(rec.code) if rec.code else (lambda: pl.read_csv(csv_path))
             data.restore_source(
                 rec.version,
                 description=rec.description,
                 tool=rec.tool,
-                code=rec.code,
-                loader=loader,
+                loader=build_loader(node),
+                ir=node,
             )
         else:
-            if rec.code is None:
-                raise ValueError(
-                    f"版本 `{rec.version}`（工具 {rec.tool}）无代码片段，无法从账本重建。"
-                )
             data.restore_derived(
                 rec.version,
                 parent=rec.parent,
                 tool=rec.tool,
                 description=rec.description,
                 reproducible=rec.reproducible,
-                op=compile_op(rec.code),
-                code=rec.code,
+                op=build_op(node),
+                ir=node,
             )

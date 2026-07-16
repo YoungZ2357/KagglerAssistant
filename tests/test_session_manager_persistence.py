@@ -90,11 +90,11 @@ class TestDeleteConversationPurgesVersionLedger:
         ledger = VersionLedgerStore(mgr.workspace.version_ledger_db)
         ledger.record(
             thread_id=thread_id, version=0, parent=None, kind="source",
-            tool=None, description="原始数据集", code="pl.read_csv('a.csv')",
+            tool=None, description="原始数据集", ir='{"kind": "source"}',
         )
         ledger.record(
             thread_id=thread_id, version=1, parent=0, kind="derived",
-            tool="standardize", description="std", code="lf = lf",
+            tool="standardize", description="std", ir='{"kind": "standardize"}',
         )
         ledger.close()
 

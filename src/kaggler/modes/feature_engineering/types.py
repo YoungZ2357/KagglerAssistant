@@ -28,6 +28,8 @@ class ComparisonOp(str, Enum):
     LE = "le"
     EQ = "eq"
     NE = "ne"
+    IS_NULL = "is_null"
+    IS_NOT_NULL = "is_not_null"
 
 
 class RowLogic(str, Enum):
@@ -67,9 +69,13 @@ class Condition(BaseModel):
 
     column: str = Field(description="列名")
     op: ComparisonOp = Field(
-        description="比较运算符：gt(大于)/lt(小于)/ge(大于等于)/le(小于等于)/eq(等于)/ne(不等于)"
+        description="比较运算符：gt(大于)/lt(小于)/ge(大于等于)/le(小于等于)/eq(等于)/ne(不等于)/"
+        "is_null(为空)/is_not_null(非空)"
     )
-    value: int | float | str | bool = Field(description="用于比较的值，类型需与列的数据类型匹配")
+    value: int | float | str | bool | None = Field(
+        default=None,
+        description="用于比较的值，类型需与列的数据类型匹配；is_null/is_not_null 时无需提供",
+    )
 
 
 class ConditionGroup(BaseModel):

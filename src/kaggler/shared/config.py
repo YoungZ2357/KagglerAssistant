@@ -18,7 +18,7 @@ class GraphConfig(BaseSettings):
 
 
 def make_llm_raw(
-        model: DeepSeekModel = DeepSeekModel.FLASH,
+        model: DeepSeekModel = DeepSeekModel.PRO,
         temperature: float = 0.0,
         enable_thinking: bool = False  # 在#37065合并前不要更改为True
 ) -> ChatDeepSeek:

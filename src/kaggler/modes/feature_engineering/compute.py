@@ -881,6 +881,8 @@ _OP_FUNCS = {
     ComparisonOp.LE: lambda e, v: e <= v,
     ComparisonOp.EQ: lambda e, v: e == v,
     ComparisonOp.NE: lambda e, v: e != v,
+    ComparisonOp.IS_NULL: lambda e, v: e.is_null(),
+    ComparisonOp.IS_NOT_NULL: lambda e, v: e.is_not_null(),
 }
 
 _OP_SYMBOLS = {
@@ -890,6 +892,16 @@ _OP_SYMBOLS = {
     ComparisonOp.LE: "<=",
     ComparisonOp.EQ: "==",
     ComparisonOp.NE: "!=",
+}
+
+# 一元运算符（无比较值）：description 文案 / 生成代码的方法名。
+_NULL_OP_DESC = {
+    ComparisonOp.IS_NULL: "为空",
+    ComparisonOp.IS_NOT_NULL: "非空",
+}
+_NULL_OP_METHOD = {
+    ComparisonOp.IS_NULL: "is_null",
+    ComparisonOp.IS_NOT_NULL: "is_not_null",
 }
 
 _LOGIC_SYMBOLS = {
@@ -904,22 +916,18 @@ def _format_condition_value(value) -> str:
     return str(value)
 
 
-def exec_filter_rows(
-    df: pl.DataFrame,
+def _validate_conditions(
     groups: list[dict],
-    group_logic: str,
-    action: str,
-) -> dict:
-    try:
-        action_enum = RowAction(action)
-    except ValueError:
-        return {"error": f"未知的 action: {action}", "hint": "支持的值: keep, delete"}
+    schema,
+    *,
+    require_value: bool = True,
+) -> dict | None:
+    """校验两层条件结构（groups → conditions）。
 
-    try:
-        group_logic_enum = RowLogic(group_logic)
-    except ValueError:
-        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
-
+    通过返回 ``None``；否则返回可直接回传给模型的 error dict。被 exec_filter_rows
+    与 exec_create_indicator 共用，是条件校验的单一真相。一元运算符
+    (is_null/is_not_null) 无需比较值，跳过值-类型兼容校验。
+    """
     if not groups:
         return {"error": "groups 不能为空"}
 
@@ -927,7 +935,6 @@ def exec_filter_rows(
     if empty_group_indices:
         return {"error": f"以下分组下标的 conditions 不能为空：{empty_group_indices}"}
 
-    schema = df.schema
     columns_set = set(schema.names())
     all_conditions = [cond for g in groups for cond in g["conditions"]]
 
@@ -949,13 +956,24 @@ def exec_filter_rows(
 
     for cond in all_conditions:
         col = cond["column"]
-        value = cond["value"]
+        value = cond.get("value")
         dtype = schema[col]
 
         try:
-            ComparisonOp(cond["op"])
+            op = ComparisonOp(cond["op"])
         except ValueError:
             errors.append({"column": col, "error": f"未知的比较运算符: {cond['op']}"})
+            continue
+
+        # 一元运算符：无需比较值，跳过类型兼容校验。
+        if op in _NULL_OP_METHOD:
+            continue
+
+        if require_value and value is None:
+            errors.append({
+                "column": col,
+                "error": f"运算符 {op.value} 必须提供比较值 value",
+            })
             continue
 
         if dtype.is_numeric():
@@ -979,44 +997,99 @@ def exec_filter_rows(
         else:
             errors.append({
                 "column": col,
-                "error": f"列 '{col}' 的类型 {dtype} 暂不支持行筛选",
+                "error": f"列 '{col}' 的类型 {dtype} 暂不支持条件比较",
             })
 
     if errors:
         return {"error": "部分条件不合法", "details": errors}
+    return None
 
+
+def _build_conditions(
+    groups: list[dict],
+    group_logic_enum: RowLogic,
+) -> tuple[pl.Expr, str, str]:
+    """把两层条件结构编译成 (combined_expr, combined_desc, combined_code)。
+
+    被 exec_filter_rows 与 exec_create_indicator 共用（条件构建的单一真相）。
+    combined_expr 末尾已 ``fill_null(False)``（条件涉及列为空时视为 False），
+    combined_code 是与之等价、可脱离 app 重放的 Polars 源码，同样以 fill_null(False) 收尾。
+    """
     def leaf_expr(cond: dict) -> pl.Expr:
         op = ComparisonOp(cond["op"])
-        return _OP_FUNCS[op](pl.col(cond["column"]), cond["value"])
+        return _OP_FUNCS[op](pl.col(cond["column"]), cond.get("value"))
 
     def leaf_desc(cond: dict) -> str:
         op = ComparisonOp(cond["op"])
-        return f"{cond['column']} {_OP_SYMBOLS[op]} {_format_condition_value(cond['value'])}"
+        if op in _NULL_OP_DESC:
+            return f"{cond['column']} {_NULL_OP_DESC[op]}"
+        return f"{cond['column']} {_OP_SYMBOLS[op]} {_format_condition_value(cond.get('value'))}"
+
+    # 代码片段:镜像 leaf_expr —— 普通运算符按 _OP_SYMBOLS(合法 Python 运算符)拼
+    # (col 符号 值);一元运算符拼 col.is_null()/.is_not_null()。
+    def leaf_code(cond: dict) -> str:
+        op = ComparisonOp(cond["op"])
+        if op in _NULL_OP_METHOD:
+            return f"{_col(cond['column'])}.{_NULL_OP_METHOD[op]}()"
+        return f"({_col(cond['column'])} {_OP_SYMBOLS[op]} {fmt_scalar(cond.get('value'))})"
 
     group_exprs = []
     group_descs = []
+    group_codes = []
     for g in groups:
         logic = RowLogic(g["logic"])
         conds = g["conditions"]
+        joiner = "&" if logic == RowLogic.AND else "|"
 
         expr = leaf_expr(conds[0])
         desc = leaf_desc(conds[0])
+        code_c = leaf_code(conds[0])
         for cond in conds[1:]:
             expr = (expr & leaf_expr(cond)) if logic == RowLogic.AND else (expr | leaf_expr(cond))
             desc = f"{desc} {_LOGIC_SYMBOLS[logic]} {leaf_desc(cond)}"
+            code_c = f"({code_c} {joiner} {leaf_code(cond)})"
 
         group_exprs.append(expr)
         group_descs.append(f"({desc})" if len(conds) > 1 else desc)
+        group_codes.append(code_c)
 
     combined_expr = group_exprs[0]
     combined_desc = group_descs[0]
-    for expr, desc in zip(group_exprs[1:], group_descs[1:]):
+    combined_code = group_codes[0]
+    group_joiner = "&" if group_logic_enum == RowLogic.AND else "|"
+    for expr, desc, code_c in zip(group_exprs[1:], group_descs[1:], group_codes[1:]):
         combined_expr = (
             (combined_expr & expr) if group_logic_enum == RowLogic.AND else (combined_expr | expr)
         )
         combined_desc = f"{combined_desc} {_LOGIC_SYMBOLS[group_logic_enum]} {desc}"
+        combined_code = f"({combined_code} {group_joiner} {code_c})"
 
     combined_expr = combined_expr.fill_null(False)
+    combined_code = f"({combined_code}).fill_null(False)"
+    return combined_expr, combined_desc, combined_code
+
+
+def exec_filter_rows(
+    df: pl.DataFrame,
+    groups: list[dict],
+    group_logic: str,
+    action: str,
+) -> dict:
+    try:
+        action_enum = RowAction(action)
+    except ValueError:
+        return {"error": f"未知的 action: {action}", "hint": "支持的值: keep, delete"}
+
+    try:
+        group_logic_enum = RowLogic(group_logic)
+    except ValueError:
+        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
+
+    validation_error = _validate_conditions(groups, df.schema, require_value=True)
+    if validation_error is not None:
+        return validation_error
+
+    combined_expr, combined_desc, combined_code = _build_conditions(groups, group_logic_enum)
 
     keep = action_enum == RowAction.KEEP
 
@@ -1026,26 +1099,7 @@ def exec_filter_rows(
         else:
             return lf.filter(~combined_expr)
 
-    # 代码片段:镜像 _op —— 逐叶按 _OP_SYMBOLS(同为合法 Python 运算符)拼出条件表达式,
-    # 组内/组间用 & / | 左结合组合,末尾 fill_null(False),再按 keep/delete 决定是否取反。
-    def _leaf_code(cond: dict) -> str:
-        op = ComparisonOp(cond["op"])
-        return f"({_col(cond['column'])} {_OP_SYMBOLS[op]} {fmt_scalar(cond['value'])})"
-
-    _group_codes: list[str] = []
-    for g in groups:
-        logic = RowLogic(g["logic"])
-        conds = g["conditions"]
-        joiner = "&" if logic == RowLogic.AND else "|"
-        expr_c = _leaf_code(conds[0])
-        for cond in conds[1:]:
-            expr_c = f"({expr_c} {joiner} {_leaf_code(cond)})"
-        _group_codes.append(expr_c)
-    combined_code = _group_codes[0]
-    _group_joiner = "&" if group_logic_enum == RowLogic.AND else "|"
-    for gc in _group_codes[1:]:
-        combined_code = f"({combined_code} {_group_joiner} {gc})"
-    combined_code = f"({combined_code}).fill_null(False)"
+    # 代码片段:镜像 _op —— combined_code 已含 fill_null(False),按 keep/delete 决定是否取反。
     code = (
         f"lf = lf.filter({combined_code})"
         if keep
@@ -1062,6 +1116,70 @@ def exec_filter_rows(
         "group_logic": group_logic_enum.value,
         "rows_kept": result_df.height,
         "rows_removed": df.height - result_df.height,
+    }]
+
+    if _preview_note:
+        summary.append(_preview_note)
+    return {
+        "op": _op,
+        "code": code,
+        "preview": preview,
+        "summary": summary,
+        "rows_before": df.height,
+        "rows_after": result_df.height,
+    }
+
+
+def exec_create_indicator(
+    df: pl.DataFrame,
+    groups: list[dict],
+    group_logic: str,
+    output_name: str,
+) -> dict:
+    """根据逻辑条件新建一个 0/1 指示符列（Int8）。
+
+    满足组合条件的行取 1，否则取 0；条件涉及列为空、无法判断真假的行按 0 处理
+    （combined_expr 末尾 fill_null(False)）。行数不变，仅追加一列。
+    """
+    try:
+        group_logic_enum = RowLogic(group_logic)
+    except ValueError:
+        return {"error": f"未知的 group_logic: {group_logic}", "hint": "支持的值: and, or"}
+
+    if not output_name:
+        return {"error": "output_name 不能为空"}
+
+    if output_name in set(df.schema.names()):
+        return {
+            "error": f"新列名与已有列冲突：{output_name}",
+            "hint": "请为 output_name 指定不冲突的名称。",
+        }
+
+    validation_error = _validate_conditions(groups, df.schema, require_value=True)
+    if validation_error is not None:
+        return validation_error
+
+    combined_expr, combined_desc, combined_code = _build_conditions(groups, group_logic_enum)
+
+    def _op(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.with_columns(
+            combined_expr.cast(pl.Int8).alias(output_name)
+        )
+
+    # 代码片段:镜像 _op —— combined_code 已含 fill_null(False),转 Int8 后作为新列。
+    code = f"lf = lf.with_columns({combined_code}.cast(pl.Int8).alias({output_name!r}))"
+
+    result_df = _op(df.lazy()).collect()
+
+    flagged = int(result_df[output_name].sum())
+    preview, _preview_note = _build_preview(result_df)
+
+    summary = [{
+        "output_column": output_name,
+        "condition_description": combined_desc,
+        "group_logic": group_logic_enum.value,
+        "rows_flagged": flagged,
+        "rows_total": result_df.height,
     }]
 
     if _preview_note:
